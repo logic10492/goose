@@ -3,3 +3,12 @@ rustflags = ["-C", "link-args=/FORCE:MULTIPLE /STACK:8388608"]
 
 [target.aarch64-pc-windows-msvc]
 rustflags = ["-C", "link-args=/FORCE:MULTIPLE /STACK:8388608"]
+
+# Work around rust-lang/rust#157750: with debug=false, cargo strips dependency
+# proc-macro dylibs, and the stripped LINKEDIT string pool is misaligned, which
+# dyld rejects on macOS 27. Not stripping loses nothing here (debug is off anyway).
+[profile.dev.package."*"]
+strip = false
+
+[profile.release.package."*"]
+strip = false

@@ -8,7 +8,7 @@ use crate::providers::base::Provider;
 use crate::providers::base::{stream_from_single_message, MessageStream};
 use crate::{config::Config, token_counter::create_token_counter};
 use anyhow::Result;
-use goose_providers::conversation::token_usage::ProviderUsage;
+use goose_providers::conversation::token_usage::{ProviderUsage, Usage};
 use goose_providers::errors::ProviderError;
 use goose_providers::model::ModelConfig;
 use indoc::indoc;
@@ -27,6 +27,11 @@ pub(crate) const TOOLCALL_SUMMARIZATION_BATCH_SIZE: usize = 10;
 pub(crate) fn tool_pair_summarization_enabled() -> bool {
     Config::global()
         .get_param::<bool>("GOOSE_TOOL_PAIR_SUMMARIZATION")
+        .unwrap_or(true)
+}
+pub(crate) fn remote_compaction_enabled() -> bool {
+    Config::global()
+        .get_param::<bool>("GOOSE_REMOTE_COMPACTION")
         .unwrap_or(true)
 }
 
@@ -346,6 +351,25 @@ async fn do_compact(
     )
     .agent_visible_messages();
 
+    if remote_compaction_enabled() {
+        match provider
+            .compact_remote(model_config, &agent_visible_messages)
+            .await
+        {
+            Ok(Some(encrypted_content)) => {
+                info!("Remote compaction succeeded");
+                let message = Message::user()
+                    .with_content(MessageContent::remote_compaction(encrypted_content));
+                let usage = ProviderUsage::new(model_config.model_name.clone(), Usage::default());
+                return Ok((message, usage));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                warn!("Remote compaction failed, falling back to local summarization: {error}");
+            }
+        }
+    }
+
     let model = GooseCompactionModel {
         provider,
         model_config,
@@ -593,7 +617,6 @@ pub fn maybe_summarize_tool_pairs(
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use goose_providers::conversation::token_usage::Usage;
     use rmcp::model::{CallToolRequestParams, Tool};
 
     fn create_tool_pair(
@@ -624,6 +647,7 @@ mod tests {
         message: Message,
         config: ModelConfig,
         max_tool_responses: Option<usize>,
+        remote: Option<Result<String, String>>,
         captured_system: std::sync::Mutex<Option<String>>,
         calls: std::sync::atomic::AtomicUsize,
     }
@@ -645,6 +669,7 @@ mod tests {
                     request_headers: None,
                 },
                 max_tool_responses: None,
+                remote: None,
                 captured_system: std::sync::Mutex::new(None),
                 calls: std::sync::atomic::AtomicUsize::new(0),
             }
@@ -652,6 +677,11 @@ mod tests {
 
         fn with_max_tool_responses(mut self, max: usize) -> Self {
             self.max_tool_responses = Some(max);
+            self
+        }
+
+        fn with_remote(mut self, remote: Result<String, String>) -> Self {
+            self.remote = Some(remote);
             self
         }
 
@@ -698,6 +728,18 @@ mod tests {
             let message = self.message.clone();
             let usage = ProviderUsage::new("mock-model".to_string(), Usage::default());
             Ok(stream_from_single_message(message, usage))
+        }
+
+        async fn compact_remote(
+            &self,
+            _model_config: &ModelConfig,
+            _messages: &[Message],
+        ) -> Result<Option<String>, ProviderError> {
+            match &self.remote {
+                None => Ok(None),
+                Some(Ok(blob)) => Ok(Some(blob.clone())),
+                Some(Err(error)) => Err(ProviderError::ExecutionError(error.clone())),
+            }
         }
 
         async fn get_context_limit(&self, _model: &str, override_limit: Option<usize>) -> usize {
@@ -1344,5 +1386,77 @@ mod tests {
         let result = tool_ids_to_summarize(&conversation, 2, 7);
         assert_eq!(result.len(), TOOLCALL_SUMMARIZATION_BATCH_SIZE);
         assert_eq!(result[0], "call0");
+    }
+
+    #[tokio::test]
+    async fn remote_compaction_result_is_installed() {
+        let provider = MockProvider::new(Message::assistant().with_text("unused"), 100_000)
+            .with_remote(Ok("encrypted-blob".to_string()));
+        let conversation = Conversation::new_unvalidated(vec![
+            Message::user().with_text("summarize this"),
+            Message::assistant().with_text("working on it"),
+        ]);
+        let model_config = provider.config.clone();
+
+        let compaction = compact_messages(
+            &provider,
+            &model_config,
+            "test-session-id",
+            &conversation,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let agent_visible = compaction.conversation.agent_visible_messages();
+        let remote_contents: Vec<_> = agent_visible
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter_map(|content| match content {
+                MessageContent::RemoteCompaction(content) => Some(content),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(remote_contents.len(), 1);
+        assert_eq!(remote_contents[0].encrypted_content, "encrypted-blob");
+        assert_eq!(provider.call_count(), 0);
+        assert!(compaction
+            .conversation
+            .messages()
+            .iter()
+            .take(2)
+            .all(|message| !message.is_agent_visible()));
+    }
+
+    #[tokio::test]
+    async fn remote_compaction_failure_falls_back_to_local_summary() {
+        let provider = MockProvider::new(Message::assistant().with_text("<mock summary>"), 100_000)
+            .with_remote(Err("boom".to_string()));
+        let conversation = Conversation::new_unvalidated(vec![
+            Message::user().with_text("summarize this"),
+            Message::assistant().with_text("working on it"),
+        ]);
+        let model_config = provider.config.clone();
+
+        let compaction = compact_messages(
+            &provider,
+            &model_config,
+            "test-session-id",
+            &conversation,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let agent_visible = compaction.conversation.agent_visible_messages();
+        let summary_text = agent_visible[0].as_concat_text();
+        assert!(summary_text.contains("<mock summary>"));
+        assert!(!agent_visible.iter().any(|message| {
+            message
+                .content
+                .iter()
+                .any(|content| matches!(content, MessageContent::RemoteCompaction(_)))
+        }));
+        assert_eq!(provider.call_count(), 1);
     }
 }

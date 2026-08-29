@@ -235,6 +235,12 @@ pub struct RedactedThinkingContentBlock {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RemoteCompactionContent {
+    pub encrypted_content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum SystemNotificationType {
     ThinkingMessage,
     ProgressMessage,
@@ -296,6 +302,7 @@ pub enum MessageContentBlock {
     RedactedThinking(RedactedThinkingContentBlock),
     SystemNotification(SystemNotificationContent),
     Error(ErrorContent),
+    RemoteCompaction(RemoteCompactionContent),
 }
 
 impl fmt::Display for MessageContentBlock {
@@ -337,6 +344,7 @@ impl fmt::Display for MessageContentBlock {
                 write!(f, "[SystemNotification: {}]", r.msg)
             }
             MessageContentBlock::Error(e) => write!(f, "[Error: {}]", e.message),
+            MessageContentBlock::RemoteCompaction(_) => write!(f, "[RemoteCompaction]"),
         }
     }
 }
@@ -545,6 +553,12 @@ impl MessageContentBlock {
 
     pub fn redacted_thinking<S: Into<String>>(data: S) -> Self {
         MessageContentBlock::RedactedThinking(RedactedThinkingContentBlock { data: data.into() })
+    }
+
+    pub fn remote_compaction<S: Into<String>>(encrypted_content: S) -> Self {
+        MessageContentBlock::RemoteCompaction(RemoteCompactionContent {
+            encrypted_content: encrypted_content.into(),
+        })
     }
 
     pub fn system_notification<S: Into<String>>(

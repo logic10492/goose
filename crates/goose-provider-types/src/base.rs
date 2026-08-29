@@ -516,6 +516,20 @@ pub trait Provider: Send + Sync {
         collect_stream(stream).await
     }
 
+    /// Attempt server-side compaction of the conversation history. Returns
+    /// `Ok(Some(encrypted_content))` when the provider compacted the history
+    /// remotely; the opaque blob is replayed to the provider in place of the
+    /// compacted messages. `Ok(None)` means remote compaction is unsupported
+    /// and the caller should fall back to local summarization.
+    async fn compact_remote(
+        &self,
+        model_config: &ModelConfig,
+        messages: &[Message],
+    ) -> Result<Option<String>, ProviderError> {
+        let _ = (model_config, messages);
+        Ok(None)
+    }
+
     /// Resolve the effective context limit for a model.
     ///
     /// `override_limit` is consumer policy and takes precedence over provider

@@ -278,6 +278,9 @@ pub fn to_bedrock_message_content(content: &MessageContent) -> Result<bedrock::C
                     .build()?,
             )
         }
+        MessageContent::RemoteCompaction(_) => {
+            bail!("RemoteCompaction content should not get passed to the provider")
+        }
     })
 }
 

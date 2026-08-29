@@ -256,6 +256,9 @@ fn message_part_json(content: &MessageContent) -> Value {
             "kind": error.kind,
             "content": error.message,
         }),
+        MessageContent::RemoteCompaction(_) => json!({
+            "type": "remote_compaction",
+        }),
     }
 }
 

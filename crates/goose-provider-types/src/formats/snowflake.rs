@@ -73,6 +73,7 @@ pub fn format_messages(messages: &[Message]) -> Vec<Value> {
                 MessageContentBlock::RedactedThinking(_redacted) => {
                     // Skip redacted thinking for now
                 }
+                MessageContentBlock::RemoteCompaction(_) => continue,
                 MessageContentBlock::Image(_) => continue, // Snowflake doesn't support image content yet
             }
         }

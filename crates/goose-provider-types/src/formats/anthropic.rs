@@ -405,6 +405,7 @@ fn format_messages_with_options(
                         }));
                     }
                 }
+                MessageContentBlock::RemoteCompaction(_) => {}
                 MessageContentBlock::Image(image) => {
                     content.push(convert_image(image, &ImageFormat::Anthropic));
                 }

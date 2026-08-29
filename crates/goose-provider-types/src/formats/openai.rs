@@ -408,6 +408,7 @@ pub fn format_messages_with_options(
                 }
                 MessageContentBlock::ToolConfirmationRequest(_) => {}
                 MessageContentBlock::ActionRequired(_) => {}
+                MessageContentBlock::RemoteCompaction(_) => {}
                 MessageContentBlock::Image(image) => {
                     if message.role == Role::User {
                         if options.supports_vision {

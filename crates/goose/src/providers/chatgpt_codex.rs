@@ -37,6 +37,8 @@ use tokio_util::io::StreamReader;
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const ISSUER: &str = "https://auth.openai.com";
 const CODEX_API_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex";
+const REMOTE_COMPACTION_INSTRUCTIONS: &str =
+    "Compact the conversation history provided in the input. Preserve everything needed to continue: user goals and constraints, decisions made, file paths and code changes, tool outcomes, and pending tasks.";
 const OAUTH_SCOPES: &[&str] = &["openid", "profile", "email", "offline_access"];
 // Canonical localhost callback port for Codex OAuth (default localhost:1455 per OpenAI docs).
 // https://developers.openai.com/codex/auth/
@@ -204,6 +206,13 @@ fn build_input_items(messages: &[Message]) -> Result<Vec<Value>> {
                         }
                     }
                 }
+                MessageContent::RemoteCompaction(compaction) => {
+                    flush_text(&mut items, role, &mut content_items);
+                    items.push(json!({
+                        "type": "compaction",
+                        "encrypted_content": compaction.encrypted_content,
+                    }));
+                }
                 _ => {}
             }
         }
@@ -212,6 +221,73 @@ fn build_input_items(messages: &[Message]) -> Result<Vec<Value>> {
     }
 
     Ok(items)
+}
+
+fn parse_compact_response(body: &Value) -> Result<String, ProviderError> {
+    let items = body
+        .get("output")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ProviderError::ExecutionError("compact response missing output".into()))?;
+    let encrypted: Vec<&str> = items
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("compaction") | Some("compaction_summary")
+            )
+        })
+        .filter_map(|item| item.get("encrypted_content").and_then(Value::as_str))
+        .collect();
+    match encrypted.as_slice() {
+        [content] => Ok((*content).to_string()),
+        _ => Err(ProviderError::ExecutionError(format!(
+            "compact response must contain exactly one compaction item, found {}",
+            encrypted.len()
+        ))),
+    }
+}
+
+fn parse_v2_compaction_stream(body: &str) -> Result<String, ProviderError> {
+    let mut completed = false;
+    let mut encrypted: Vec<String> = Vec::new();
+    for block in body.replace("\r\n", "\n").split("\n\n") {
+        let data = block
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(str::trim_start)
+            .collect::<Vec<_>>()
+            .join("\n");
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let event: Value = serde_json::from_str(&data).map_err(|e| {
+            ProviderError::ExecutionError(format!("invalid compaction stream JSON: {e}"))
+        })?;
+        match event.get("type").and_then(Value::as_str) {
+            Some("response.completed") => completed = true,
+            Some("response.output_item.done") => {
+                let item = event.get("item").unwrap_or(&event);
+                if item.get("type").and_then(Value::as_str) == Some("compaction") {
+                    if let Some(content) = item.get("encrypted_content").and_then(Value::as_str) {
+                        encrypted.push(content.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if !completed {
+        return Err(ProviderError::ExecutionError(
+            "compaction stream closed before response.completed".into(),
+        ));
+    }
+    match encrypted.as_slice() {
+        [content] => Ok(content.clone()),
+        _ => Err(ProviderError::ExecutionError(format!(
+            "compaction stream must yield exactly one compaction item, found {}",
+            encrypted.len()
+        ))),
+    }
 }
 
 fn get_reasoning_effort(model_name: &str) -> String {
@@ -908,7 +984,12 @@ impl ChatGptCodexProvider {
         })
     }
 
-    async fn post_streaming(&self, payload: &Value) -> Result<reqwest::Response, ProviderError> {
+    async fn post_json(
+        &self,
+        path: &str,
+        payload: &Value,
+        extra_headers: &[(&'static str, &str)],
+    ) -> Result<reqwest::Response, ProviderError> {
         let token_data = self
             .auth_provider
             .get_valid_token()
@@ -924,6 +1005,14 @@ impl ChatGptCodexProvider {
             );
         }
 
+        for (name, value) in extra_headers {
+            headers.insert(
+                reqwest::header::HeaderName::from_static(name),
+                reqwest::header::HeaderValue::from_str(value)
+                    .map_err(|e| ProviderError::ExecutionError(e.to_string()))?,
+            );
+        }
+
         let client = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
             .read_timeout(std::time::Duration::from_secs(
@@ -932,7 +1021,7 @@ impl ChatGptCodexProvider {
             .build()
             .map_err(|e| ProviderError::ExecutionError(e.to_string()))?;
         let request = client
-            .post(format!("{}/responses", CODEX_API_ENDPOINT))
+            .post(format!("{}{}", CODEX_API_ENDPOINT, path))
             .header(
                 "Authorization",
                 format!("Bearer {}", token_data.access_token),
@@ -950,6 +1039,19 @@ impl ChatGptCodexProvider {
         .await?;
 
         handle_status(response).await
+    }
+
+    async fn post_streaming(
+        &self,
+        payload: &Value,
+        remote_compaction_replay: bool,
+    ) -> Result<reqwest::Response, ProviderError> {
+        let extra_headers: &[(&'static str, &str)] = if remote_compaction_replay {
+            &[("x-codex-beta-features", "remote_compaction_v2")]
+        } else {
+            &[]
+        };
+        self.post_json("/responses", payload, extra_headers).await
     }
 }
 
@@ -1011,10 +1113,17 @@ impl Provider for ChatGptCodexProvider {
             .map_err(|e| ProviderError::ExecutionError(e.to_string()))?;
         payload["stream"] = serde_json::Value::Bool(true);
 
+        let remote_compaction_replay = messages.iter().any(|message| {
+            message
+                .content
+                .iter()
+                .any(|content| matches!(content, MessageContent::RemoteCompaction(_)))
+        });
         let response = self
             .with_retry(|| async {
                 let payload_clone = payload.clone();
-                self.post_streaming(&payload_clone).await
+                self.post_streaming(&payload_clone, remote_compaction_replay)
+                    .await
             })
             .await?;
 
@@ -1034,6 +1143,52 @@ impl Provider for ChatGptCodexProvider {
                 yield (message, usage);
             }
         }))
+    }
+
+    async fn compact_remote(
+        &self,
+        model_config: &ModelConfig,
+        messages: &[Message],
+    ) -> Result<Option<String>, ProviderError> {
+        let input = build_input_items(messages)
+            .map_err(|e| ProviderError::ExecutionError(e.to_string()))?;
+        let mut payload = json!({
+            "model": model_config.model_name,
+            "instructions": REMOTE_COMPACTION_INSTRUCTIONS,
+            "tools": [],
+            "parallel_tool_calls": false,
+            "store": false,
+        });
+
+        let mut v2_input = input.clone();
+        v2_input.push(json!({ "type": "compaction_trigger" }));
+        payload["input"] = json!(v2_input);
+        payload["stream"] = json!(true);
+
+        let v2 = async {
+            let response = self.post_json("/responses", &payload, &[]).await?;
+            let body = response
+                .text()
+                .await
+                .map_err(|e| ProviderError::ExecutionError(e.to_string()))?;
+            parse_v2_compaction_stream(&body)
+        }
+        .await;
+
+        match v2 {
+            Ok(content) => Ok(Some(content)),
+            Err(v2_error) => {
+                tracing::debug!("v2 remote compaction failed, trying legacy endpoint: {v2_error}");
+                payload["input"] = json!(input);
+                payload["stream"] = json!(false);
+                let response = self.post_json("/responses/compact", &payload, &[]).await?;
+                let body = response
+                    .json::<Value>()
+                    .await
+                    .map_err(|e| ProviderError::ExecutionError(e.to_string()))?;
+                parse_compact_response(&body).map(Some)
+            }
+        }
     }
 
     async fn configure_oauth(&self) -> Result<(), ProviderError> {
@@ -1466,5 +1621,74 @@ mod tests {
         let payload = create_codex_request(&model, "system prompt", &[], &[]).unwrap();
         let instructions = payload["instructions"].as_str().unwrap();
         assert_eq!(instructions, "system prompt");
+    }
+
+    #[test]
+    fn test_build_input_items_replays_remote_compaction() {
+        let messages = vec![
+            Message::user().with_text("before"),
+            Message::user().with_content(MessageContent::remote_compaction("blob-123")),
+            Message::user().with_text("after"),
+        ];
+        let payload = json!({ "input": build_input_items(&messages).unwrap() });
+
+        assert_eq!(
+            input_kinds(&payload),
+            vec![
+                "message:user".to_string(),
+                "compaction".to_string(),
+                "message:user".to_string(),
+            ]
+        );
+        assert_eq!(payload["input"][1]["type"], "compaction");
+        assert_eq!(payload["input"][1]["encrypted_content"], "blob-123");
+    }
+
+    #[test_case("compaction"; "compaction item")]
+    #[test_case("compaction_summary"; "compaction summary item")]
+    fn test_parse_compact_response(type_name: &str) {
+        let body = json!({
+            "output": [{ "type": type_name, "encrypted_content": "blob-123" }]
+        });
+        assert_eq!(parse_compact_response(&body).unwrap(), "blob-123");
+    }
+
+    #[test_case(json!({}); "missing output")]
+    #[test_case(json!({ "output": [] }); "empty output")]
+    #[test_case(json!({
+        "output": [
+            { "type": "compaction", "encrypted_content": "blob-1" },
+            { "type": "compaction_summary", "encrypted_content": "blob-2" }
+        ]
+    }); "multiple compaction items")]
+    #[test_case(json!({ "output": [{ "type": "compaction" }] }); "missing encrypted content")]
+    fn test_parse_compact_response_rejects_invalid_body(body: Value) {
+        assert!(parse_compact_response(&body).is_err());
+    }
+
+    #[test]
+    fn test_parse_v2_compaction_stream() {
+        let body = "event: response.output_item.done\n\
+                    data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",\"encrypted_content\":\"blob-9\"}}\n\
+                    \n\
+                    event: response.completed\n\
+                    data: {\"type\":\"response.completed\",\"usage\":{\"total_tokens\":42}}\n\n";
+        assert_eq!(parse_v2_compaction_stream(body).unwrap(), "blob-9");
+    }
+
+    #[test]
+    fn test_parse_v2_compaction_stream_requires_completed() {
+        let body = "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",\"encrypted_content\":\"blob-9\"}}\n\n";
+        assert!(parse_v2_compaction_stream(body).is_err());
+    }
+
+    #[test]
+    fn test_parse_v2_compaction_stream_rejects_multiple_items() {
+        let body = "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",\"encrypted_content\":\"blob-1\"}}\n\
+                    \n\
+                    data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",\"encrypted_content\":\"blob-2\"}}\n\
+                    \n\
+                    data: {\"type\":\"response.completed\"}\n\n";
+        assert!(parse_v2_compaction_stream(body).is_err());
     }
 }
