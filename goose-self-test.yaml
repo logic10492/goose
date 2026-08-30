@@ -11,6 +11,7 @@ activities:
   - Validate Azure AI Foundry provider routing and deployment aliases
   - Analyze code structure and parsing capabilities
   - Test extension discovery and management
+  - Test aggregated web search (web_search) and page content extraction (web_fetch)
   - Test load tool for knowledge injection and discovery
   - Test delegate tool for task delegation (sync and async)
   - Test multi-turn thinking preservation for providers that reject replayed reasoning_content
@@ -124,7 +125,10 @@ extensions:
   - type: builtin
     name: extensionmanager
   - type: builtin
+  - type: builtin
     name: skills
+  - type: builtin
+    name: websearch
 
 prompt: |
   Execute the Goose Self-Testing Integration Suite in {{ workspace_dir }}.
@@ -190,6 +194,14 @@ prompt: |
   2. Document all available extensions
   3. Test enabling and disabling dynamic extensions (if any available)
   4. Verify extension isolation between enabled extensions
+
+  ### Websearch Extension Testing (Built-in)
+  1. Call `web_search` with query "latest stable Rust version" and verify it returns an
+     answer with source URLs, or a clear "Web search unavailable" message listing per-backend
+     reasons when no search backend credentials are configured
+  2. Call `web_fetch` with url "https://example.com" and verify it returns page text
+     containing "Example Domain"
+  3. Call `web_fetch` with an invalid URL ("not-a-url") and verify it fails gracefully
 
   Log results to: {{ workspace_dir }}/phase2_extensions.md
   {% endif %}

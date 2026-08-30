@@ -11,6 +11,7 @@ pub mod summarize;
 pub mod summon;
 pub mod todo;
 pub mod tom;
+pub mod websearch;
 
 use std::collections::HashMap;
 
@@ -218,6 +219,21 @@ pub static PLATFORM_EXTENSIONS: Lazy<HashMap<&'static str, PlatformExtensionDef>
                 hidden: false,
                 client_factory: |ctx| {
                     Some(Box::new(crate::skills::SkillsClient::new(ctx).unwrap()))
+                },
+            },
+        );
+        map.insert(
+            websearch::EXTENSION_NAME,
+            PlatformExtensionDef {
+                name: websearch::EXTENSION_NAME,
+                display_name: "Web Search",
+                description:
+                    "Search the web via aggregated backends (deepseek, kimi, codex, openai) with fallback, and fetch page content",
+                default_enabled: false,
+                unprefixed_tools: true,
+                hidden: false,
+                client_factory: |ctx| {
+                    Some(Box::new(websearch::WebSearchClient::new(ctx).unwrap()))
                 },
             },
         );

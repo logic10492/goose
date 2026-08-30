@@ -943,6 +943,33 @@ impl ChatGptCodexAuthProvider {
     }
 }
 
+pub(crate) struct CodexAccessToken {
+    pub(crate) access_token: String,
+    pub(crate) account_id: Option<String>,
+}
+
+/// Returns a valid stored Codex access token, refreshing it through the stored
+/// refresh token when expired. Never starts the interactive OAuth flow; returns
+/// None when the user has not authenticated the chatgpt_codex provider.
+pub(crate) async fn get_stored_codex_token() -> Option<CodexAccessToken> {
+    let cache = TokenCache::new();
+    let mut token_data = cache.load()?;
+    if token_data.expires_at <= Utc::now() + chrono::Duration::seconds(60) {
+        let new_tokens = refresh_access_token_with_issuer(ISSUER, &token_data.refresh_token)
+            .await
+            .ok()?;
+        token_data.access_token = new_tokens.access_token;
+        token_data.refresh_token = new_tokens.refresh_token;
+        token_data.expires_at =
+            Utc::now() + chrono::Duration::seconds(new_tokens.expires_in.unwrap_or(3600));
+        cache.save(&token_data).ok()?;
+    }
+    Some(CodexAccessToken {
+        access_token: token_data.access_token,
+        account_id: token_data.account_id,
+    })
+}
+
 #[async_trait]
 impl AuthProvider for ChatGptCodexAuthProvider {
     async fn get_auth_header(&self) -> Result<(String, String)> {

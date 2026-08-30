@@ -156,6 +156,16 @@ Template:
 ## tom
 
 
+## websearch
+
+### Instructions
+Aggregated web search across multiple backends (deepseek, kimi, codex, openai)
+with automatic fallback, plus a web_fetch tool to read full page content.
+
+Use web_search for current information and facts not in training data. Use
+web_fetch to read the full content of a specific URL, for example a promising
+search result.
+
 
 # Response Guidelines
 
