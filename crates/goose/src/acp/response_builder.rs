@@ -357,16 +357,29 @@ fn build_thinking_effort_choices(
                 off,
             )
         }
-        ThinkingEffortSupport::Unspecified => (
-            thinking_effort_values(model_config)
-                .iter()
-                .map(|effort| {
-                    let effort = effort.to_string();
-                    SessionConfigSelectOption::new(effort.clone(), effort)
-                })
-                .collect(),
-            current_thinking_effort_value(model_config),
-        ),
+        ThinkingEffortSupport::Unspecified => {
+            let configured = model_config
+                .request_param::<Vec<String>>("thinking_efforts")
+                .map(|values| {
+                    values
+                        .into_iter()
+                        .filter_map(|value| value.parse().ok())
+                        .collect::<Vec<ThinkingEffort>>()
+                });
+            let values = configured
+                .as_deref()
+                .unwrap_or_else(|| thinking_effort_values(model_config));
+            (
+                values
+                    .iter()
+                    .map(|effort| {
+                        let effort = effort.to_string();
+                        SessionConfigSelectOption::new(effort.clone(), effort)
+                    })
+                    .collect(),
+                current_thinking_effort_value(model_config),
+            )
+        }
     }
 }
 

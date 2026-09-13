@@ -2,7 +2,7 @@ use crate::config::paths::Paths;
 use crate::conversation::message::{Message, MessageContent};
 use crate::providers::api_client::{AuthProvider, RequestBuilderDecorator};
 use crate::providers::base::{
-    ConfigKey, MessageStream, Provider, ProviderDef, ProviderMetadata,
+    ConfigKey, MessageStream, ModelInfo, Provider, ProviderDef, ProviderMetadata,
     DEFAULT_CONNECT_TIMEOUT_SECS, DEFAULT_PROVIDER_TIMEOUT_SECS,
 };
 use crate::providers::openai_compatible::handle_status;
@@ -16,6 +16,7 @@ use base64::Engine;
 use chrono::{DateTime, Utc};
 use futures::future::BoxFuture;
 use futures::{StreamExt, TryStreamExt};
+use goose_providers::context_limit::ContextLimitResolver;
 use goose_providers::errors::ProviderError;
 use goose_providers::formats::openai_responses::responses_api_to_streaming_message;
 use goose_providers::model::ModelConfig;
@@ -37,8 +38,7 @@ use tokio_util::io::StreamReader;
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const ISSUER: &str = "https://auth.openai.com";
 const CODEX_API_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex";
-const REMOTE_COMPACTION_INSTRUCTIONS: &str =
-    "Compact the conversation history provided in the input. Preserve everything needed to continue: user goals and constraints, decisions made, file paths and code changes, tool outcomes, and pending tasks.";
+const REMOTE_COMPACTION_INSTRUCTIONS: &str = "Compact the conversation history provided in the input. Preserve everything needed to continue: user goals and constraints, decisions made, file paths and code changes, tool outcomes, and pending tasks.";
 const OAUTH_SCOPES: &[&str] = &["openid", "profile", "email", "offline_access"];
 // Canonical localhost callback port for Codex OAuth (default localhost:1455 per OpenAI docs).
 // https://developers.openai.com/codex/auth/
@@ -47,7 +47,7 @@ const OAUTH_PORT: u16 = 1455;
 const OAUTH_TIMEOUT_SECS: u64 = 300;
 const HTML_AUTO_CLOSE_TIMEOUT_MS: u64 = 2000;
 
-const CHATGPT_CODEX_PROVIDER_NAME: &str = "chatgpt_codex";
+pub(crate) const CHATGPT_CODEX_PROVIDER_NAME: &str = "chatgpt_codex";
 pub const CHATGPT_CODEX_DEFAULT_MODEL: &str = "gpt-5.5";
 
 #[derive(Debug)]
@@ -57,6 +57,10 @@ pub struct ChatGptCodexModelAttrs {
 }
 
 pub const CHATGPT_CODEX_KNOWN_MODELS: &[ChatGptCodexModelAttrs] = &[
+    ChatGptCodexModelAttrs {
+        name: "gpt-6-astra",
+        reasoning_levels: &["none", "low", "medium", "high", "xhigh"],
+    },
     ChatGptCodexModelAttrs {
         name: "gpt-5.6-sol",
         reasoning_levels: &["none", "low", "medium", "high", "xhigh"],
@@ -83,6 +87,46 @@ pub const CHATGPT_CODEX_KNOWN_MODELS: &[ChatGptCodexModelAttrs] = &[
     },
 ];
 
+const GPT_6_ASTRA_CONTEXT_LIMIT: usize = 1_100_000;
+
+fn known_model_names() -> Vec<&'static str> {
+    CHATGPT_CODEX_KNOWN_MODELS.iter().map(|m| m.name).collect()
+}
+
+pub fn is_known_reasoning_model(model_name: &str) -> bool {
+    CHATGPT_CODEX_KNOWN_MODELS
+        .iter()
+        .any(|model| model.name == model_name)
+}
+
+fn known_models() -> Vec<ModelInfo> {
+    CHATGPT_CODEX_KNOWN_MODELS
+        .iter()
+        .map(|model| {
+            let mut info = ModelInfo::new(model.name);
+            info.context_limit = context_limit_for_model(model.name);
+            info.reasoning = true;
+            info
+        })
+        .collect()
+}
+
+fn context_limit_for_model(model_name: &str) -> Option<usize> {
+    (model_name == "gpt-6-astra").then_some(GPT_6_ASTRA_CONTEXT_LIMIT)
+}
+
+pub fn apply_model_metadata(mut model: ModelConfig) -> ModelConfig {
+    if model.model_name == "gpt-6-astra" {
+        if model.context_limit.is_none() {
+            model.context_limit = Some(GPT_6_ASTRA_CONTEXT_LIMIT);
+        }
+        if model.reasoning.is_none() {
+            model.reasoning = Some(true);
+        }
+    }
+    model
+}
+
 const CHATGPT_CODEX_DOC_URL: &str = "https://openai.com/chatgpt";
 
 const DEFAULT_REASONING_LEVELS: &[&str] = &["medium", "high"];
@@ -93,10 +137,6 @@ pub fn reasoning_levels_for_model(model_name: &str) -> &'static [&'static str] {
         .find(|m| m.name == model_name)
         .map(|m| m.reasoning_levels)
         .unwrap_or(DEFAULT_REASONING_LEVELS)
-}
-
-fn known_model_names() -> Vec<&'static str> {
-    CHATGPT_CODEX_KNOWN_MODELS.iter().map(|m| m.name).collect()
 }
 
 #[derive(Debug)]
@@ -1084,12 +1124,12 @@ impl ChatGptCodexProvider {
 
 impl goose_providers::base::ProviderDescriptor for ChatGptCodexProvider {
     fn metadata() -> ProviderMetadata {
-        ProviderMetadata::new(
+        ProviderMetadata::with_models(
             CHATGPT_CODEX_PROVIDER_NAME,
             "ChatGPT Codex",
             "Use your ChatGPT Plus/Pro subscription for GPT-5 Codex models via OAuth",
             CHATGPT_CODEX_DEFAULT_MODEL,
-            known_model_names(),
+            known_models(),
             CHATGPT_CODEX_DOC_URL,
             vec![ConfigKey::new_oauth(
                 "CHATGPT_CODEX_TOKEN",
@@ -1127,6 +1167,16 @@ impl ProviderDef for ChatGptCodexProvider {
 impl Provider for ChatGptCodexProvider {
     fn get_name(&self) -> &str {
         &self.name
+    }
+
+    async fn get_context_limit(&self, model: &str, override_limit: Option<usize>) -> usize {
+        if let Some(limit) = override_limit.or_else(|| context_limit_for_model(model)) {
+            return limit;
+        }
+
+        ContextLimitResolver::new(self.get_name())
+            .resolve(model, None, || async { Ok(None) })
+            .await
     }
 
     async fn stream(
@@ -1623,6 +1673,7 @@ mod tests {
         assert_eq!(claims.chatgpt_account_id.as_deref(), Some("account-1"));
     }
 
+    #[test_case("gpt-6-astra", &["none", "low", "medium", "high", "xhigh"]; "gpt 6 astra supports extended reasoning levels")]
     #[test_case("gpt-5.6-sol", &["none", "low", "medium", "high", "xhigh"]; "gpt 5.6 sol supports extended reasoning levels")]
     #[test_case("gpt-5.6-terra", &["none", "low", "medium", "high", "xhigh"]; "gpt 5.6 terra supports extended reasoning levels")]
     #[test_case("gpt-5.6-luna", &["none", "low", "medium", "high", "xhigh"]; "gpt 5.6 luna supports extended reasoning levels")]
@@ -1633,13 +1684,52 @@ mod tests {
     }
 
     #[test]
-    fn test_known_model_names_include_gpt_5_6_models() {
+    fn test_known_model_names_include_gpt_6_astra_and_gpt_5_6_models() {
         let names = known_model_names();
 
+        assert!(names.contains(&"gpt-6-astra"));
         assert!(names.contains(&"gpt-5.6-sol"));
         assert!(names.contains(&"gpt-5.6-terra"));
         assert!(names.contains(&"gpt-5.6-luna"));
         assert!(names.contains(&"gpt-5.6"));
+    }
+
+    #[test]
+    fn test_gpt_6_astra_metadata() {
+        let metadata = apply_model_metadata(ModelConfig::new("gpt-6-astra"));
+
+        assert_eq!(metadata.context_limit(), 1_100_000);
+        assert!(metadata.is_reasoning_model());
+    }
+
+    #[test]
+    fn test_gpt_6_astra_provider_metadata_has_context_limit() {
+        let metadata =
+            <ChatGptCodexProvider as goose_providers::base::ProviderDescriptor>::metadata();
+        let model = metadata
+            .known_models
+            .iter()
+            .find(|model| model.name == "gpt-6-astra")
+            .unwrap();
+
+        assert_eq!(model.context_limit, Some(1_100_000));
+        assert!(model.reasoning);
+    }
+
+    #[tokio::test]
+    async fn test_gpt_6_astra_context_limit() {
+        let provider = ChatGptCodexProvider::from_env(None).await.unwrap();
+
+        assert_eq!(
+            provider.get_context_limit("gpt-6-astra", None).await,
+            1_100_000
+        );
+        assert_eq!(
+            provider
+                .get_context_limit("gpt-6-astra", Some(256_000))
+                .await,
+            256_000
+        );
     }
 
     #[test]

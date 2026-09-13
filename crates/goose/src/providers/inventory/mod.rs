@@ -1154,12 +1154,19 @@ fn inventory_models_from_snapshot(
         return configured_models_to_inventory(provider_family, configured_models);
     }
 
-    match snapshot {
+    let mut models = match snapshot {
         Some(snapshot) if !snapshot.models.is_empty() || snapshot.last_updated_at.is_some() => {
             snapshot.models.clone()
         }
-        _ => configured_models_to_inventory(provider_family, configured_models),
+        _ => Vec::new(),
+    };
+
+    for configured in configured_models_to_inventory(provider_family, configured_models) {
+        if !models.iter().any(|model| model.id == configured.id) {
+            models.push(configured);
+        }
     }
+    models
 }
 
 fn enriched_model(
@@ -1185,7 +1192,14 @@ fn enriched_model(
             .as_ref()
             .map(|model| model.limit.context)
             .or(fallback_context_limit),
-        reasoning: canonical.as_ref().and_then(|model| model.reasoning),
+        reasoning: canonical
+            .as_ref()
+            .and_then(|model| model.reasoning)
+            .or_else(|| {
+                (provider_family == crate::providers::chatgpt_codex::CHATGPT_CODEX_PROVIDER_NAME
+                    && crate::providers::chatgpt_codex::is_known_reasoning_model(model_id))
+                .then_some(true)
+            }),
         recommended: false,
     }
 }
@@ -1341,6 +1355,16 @@ mod tests {
     }
 
     #[test]
+    fn chatgpt_codex_inventory_marks_gpt_6_astra_as_reasoning() {
+        let models =
+            configured_models_to_inventory("chatgpt_codex", &[ModelInfo::new("gpt-6-astra")]);
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].context_limit, None);
+        assert_eq!(models[0].reasoning, Some(true));
+    }
+
+    #[test]
     fn databricks_v2_inventory_prefers_goose_model_ids_for_duplicate_names() {
         let models = enrich_model_ids_with_canonical(
             "databricks_v2",
@@ -1402,7 +1426,7 @@ mod tests {
     }
 
     #[test]
-    fn inventory_preserves_empty_models_after_successful_refresh() {
+    fn inventory_preserves_configured_models_after_successful_refresh() {
         let configured_models = [ModelInfo::new("claude-sonnet-4-5").with_context_limit(0)];
         let snapshot = InventorySnapshot {
             models: vec![],
@@ -1414,7 +1438,8 @@ mod tests {
         let models =
             inventory_models_from_snapshot(Some(&snapshot), "anthropic", &configured_models, true);
 
-        assert!(models.is_empty());
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "claude-sonnet-4-5");
     }
 
     #[test]

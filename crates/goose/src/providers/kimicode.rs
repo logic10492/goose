@@ -99,6 +99,18 @@ pub(crate) fn has_configured_token() -> bool {
         .is_some()
 }
 
+/// Returns a valid stored Kimi Code access token, refreshing through the stored
+/// refresh token when expired. Never starts the interactive device flow; returns
+/// None when the user has not authenticated the kimi_code provider.
+pub(crate) async fn get_stored_kimi_token() -> Option<String> {
+    let provider = KimiCodeProvider::from_env(None).await.ok()?;
+    provider
+        .ensure_token()
+        .await
+        .ok()
+        .map(|token| token.access_token)
+}
+
 impl TokenCache {
     fn new() -> Self {
         Self {

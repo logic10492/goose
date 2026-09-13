@@ -23,12 +23,13 @@ pub fn model_config_from_user_config_with_session_settings(
     model_name: impl AsRef<str>,
     previous: Option<&ModelConfig>,
     request_params: Option<HashMap<String, Value>>,
-    _context_limit: Option<usize>,
+    context_limit: Option<usize>,
 ) -> Result<ModelConfig> {
     let config = Config::global();
     let model = base_model_config_from_user_config(provider_name, model_name.as_ref())?;
     let model = materialize_model_config_inner(model, provider_name, false)?
         .with_inherited_session_settings_from(previous, request_params)
+        .with_context_limit(context_limit)
         .with_default_thinking_effort(config.get_goose_thinking_effort());
 
     Ok(apply_canonical_limits(provider_name, model))
@@ -40,10 +41,16 @@ pub fn materialize_model_config(provider_name: &str, model: ModelConfig) -> Resu
 }
 
 fn apply_canonical_limits(provider_name: &str, model: ModelConfig) -> ModelConfig {
-    if provider_name == goose_providers::azure_foundry::AZURE_FOUNDRY_PROVIDER_NAME {
+    let model = if provider_name == goose_providers::azure_foundry::AZURE_FOUNDRY_PROVIDER_NAME {
         model
     } else {
         model.with_canonical_limits(provider_name)
+    };
+
+    if provider_name == crate::providers::chatgpt_codex::CHATGPT_CODEX_PROVIDER_NAME {
+        crate::providers::chatgpt_codex::apply_model_metadata(model)
+    } else {
+        model
     }
 }
 
@@ -109,17 +116,12 @@ pub async fn get_fast_model(
     }
 }
 
-/// A one-shot task summarizes a transcript or tool result that never recurs, so
-/// a prompt cache entry written for it can never be read back and only costs the
-/// cache-write premium.
 fn one_shot_model_config(model_config: ModelConfig) -> ModelConfig {
     model_config
         .with_thinking_effort(ThinkingEffort::Off)
         .with_prompt_cache_disabled()
 }
 
-/// Run a completion for a lightweight "fast" task (session naming, tool-call
-/// labels, orchestrator routing) using the provider's fast model.
 pub async fn complete_fast(
     provider: &dyn Provider,
     model_config: &ModelConfig,
@@ -163,8 +165,6 @@ pub async fn complete_fast(
     }
 }
 
-/// Run a completion for compaction or tool-result summarization on the main
-/// session model with one-shot semantics (thinking off, no prompt-cache writes).
 pub async fn complete_compaction(
     provider: &dyn Provider,
     model_config: &ModelConfig,
@@ -246,7 +246,6 @@ fn get_goose_toolshim(config: &Config) -> Result<Option<bool>> {
     }
 }
 
-/// Resolve the global toolshim setting, defaulting to false when unset.
 pub fn global_toolshim() -> bool {
     get_goose_toolshim(Config::global())
         .ok()
@@ -264,7 +263,6 @@ fn get_goose_toolshim_model(config: &Config) -> Result<Option<String>> {
         Err(e) => Err(e.into()),
     }
 }
-
 fn parse_bool_config(key: &str, value: &str) -> Result<bool> {
     match value.to_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Ok(true),
@@ -280,12 +278,12 @@ fn parse_yaml_bool_config(key: &str, value: serde_yaml::Value) -> Result<bool> {
         serde_yaml::Value::Bool(value) => Ok(value),
         serde_yaml::Value::Number(value) => parse_bool_config(key, &value.to_string()),
         serde_yaml::Value::String(value) => parse_bool_config(key, &value),
-        other => {
-            Err(anyhow!(
+        other => Err(anyhow!(
             "Invalid value for '{key}': '{}' - must be one of: 1, true, yes, on, 0, false, no, off",
-            serde_yaml::to_string(&other).unwrap_or_else(|_| "<unprintable>".to_string()).trim()
-        ))
-        }
+            serde_yaml::to_string(&other)
+                .unwrap_or_else(|_| "<unprintable>".to_string())
+                .trim()
+        )),
     }
 }
 
@@ -320,5 +318,18 @@ mod azure_foundry_tests {
 
         assert_eq!(config.model_name, "gpt-5-none");
         assert_eq!(config.thinking_effort(), None);
+    }
+}
+
+#[cfg(test)]
+mod chatgpt_codex_tests {
+    use super::*;
+
+    #[test]
+    fn gpt_6_astra_uses_chatgpt_codex_metadata() {
+        let config = model_config_from_user_config("chatgpt_codex", "gpt-6-astra").unwrap();
+
+        assert_eq!(config.context_limit(), 1_100_000);
+        assert!(config.is_reasoning_model());
     }
 }

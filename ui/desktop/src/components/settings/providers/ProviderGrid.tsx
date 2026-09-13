@@ -293,7 +293,12 @@ function ProviderCards({
     api_url: editingProvider.config.apiUrl,
     base_path: editingProvider.config.basePath ?? undefined,
     api_key: '',
-    models: editingProvider.config.models ?? [],
+    models: (editingProvider.config.models ?? []) as unknown as Array<{
+      name: string;
+      contextLimit?: number | null;
+      reasoning?: boolean | null;
+      thinkingEfforts?: string[] | null;
+    } | string>,
     supports_streaming: editingProvider.config.supportsStreaming ?? true,
     requires_auth: editingProvider.config.requiresAuth ?? true,
     headers: editingProvider.config.headers ?? undefined,

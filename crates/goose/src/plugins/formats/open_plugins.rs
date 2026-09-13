@@ -594,6 +594,53 @@ mod tests {
     }
 
     #[test]
+    fn installs_shuorenhua_example_package() {
+        let install_root = tempfile::tempdir().unwrap();
+        let checkout = tempfile::tempdir().unwrap();
+        let example =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/plugins/shuorenhua");
+        copy_dir_all(&example, checkout.path()).unwrap();
+
+        let installed = try_install_from_manifest_at_root(
+            "https://example.invalid/shuorenhua.git",
+            checkout.path(),
+            install_root.path(),
+            &PluginInstallOptions::default(),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(installed.name, "shuorenhua");
+        assert_eq!(installed.version, "2.4.0");
+        assert_eq!(installed.format, PluginFormat::OpenPlugins);
+        assert_eq!(installed.skills.len(), 1);
+        assert_eq!(installed.skills[0].name, "shuorenhua:shuorenhua");
+        assert_eq!(installed.directory, install_root.path().join("shuorenhua"));
+        assert!(installed.directory.is_dir());
+        let installed_skill_path = installed.directory.join("skills/shuorenhua/SKILL.md");
+        assert!(installed_skill_path.is_file());
+        let installed_skill = fs::read_to_string(installed_skill_path).unwrap();
+        assert_eq!(
+            extract_skill_name(&installed_skill).as_deref(),
+            Some("shuorenhua:shuorenhua")
+        );
+        assert!(installed_skill.contains("检查和清理中英文文本里的 AI 套路"));
+        assert!(installed_skill.contains("这份 skill 不是敏感词替换器"));
+
+        let installed_reference_path = installed
+            .directory
+            .join("skills/shuorenhua/references/protected-spans.md");
+        assert!(installed_reference_path.is_file());
+        assert!(fs::read_to_string(installed_reference_path)
+            .unwrap()
+            .contains("# Protected Spans"));
+        assert!(installed
+            .directory
+            .join("skills/shuorenhua/references/structures.md")
+            .is_file());
+    }
+
+    #[test]
     fn preserves_existing_plugin_directory() {
         let install_root = tempfile::tempdir().unwrap();
         let destination = install_root.path().join("test-plugin");

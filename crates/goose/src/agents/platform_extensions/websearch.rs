@@ -267,11 +267,18 @@ impl WebSearchClient {
                 search_deepseek(&self.http, &base_url, &api_key, request).await
             }
             Backend::Kimi => {
-                let api_key = config_secret("KIMI_CODE_TOKEN")
+                let api_key = match config_secret("KIMI_CODE_TOKEN")
                     .or_else(|| config_secret("KIMI_API_KEY"))
-                    .ok_or_else(|| {
-                        anyhow!("not configured (missing KIMI_CODE_TOKEN or KIMI_API_KEY)")
-                    })?;
+                {
+                    Some(key) => key,
+                    None => crate::providers::kimicode::get_stored_kimi_token()
+                        .await
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "not configured (missing KIMI_CODE_TOKEN/KIMI_API_KEY and no kimi_code login)"
+                            )
+                        })?,
+                };
                 let base_url = config_param("KIMI_BASE_URL")
                     .unwrap_or_else(|| KIMI_DEFAULT_BASE_URL.to_string());
                 search_kimi(&self.http, &base_url, &api_key, request).await
@@ -318,16 +325,33 @@ impl WebSearchClient {
             return Err("Only http:// and https:// URLs are supported".to_string());
         }
 
-        let response = self
+        let response = match self
             .http
             .get(&url)
             .header(reqwest::header::USER_AGENT, FETCH_USER_AGENT)
+            .header(
+                reqwest::header::ACCEPT,
+                "text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,*/*;q=0.5",
+            )
+            .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9")
             .timeout(Duration::from_secs(30))
             .send()
             .await
-            .map_err(|e| format!("Fetch failed: {}", e))?
-            .error_for_status()
-            .map_err(|e| format!("Fetch failed: {}", e))?;
+        {
+            Ok(response) => match response.error_for_status() {
+                Ok(response) => response,
+                Err(e) => {
+                    return self
+                        .fetch_with_codex_fallback(&url, format!("Fetch failed: {}", e), max_chars)
+                        .await
+                }
+            },
+            Err(e) => {
+                return self
+                    .fetch_with_codex_fallback(&url, format!("Fetch failed: {}", e), max_chars)
+                    .await
+            }
+        };
 
         if let Some(length) = response.content_length() {
             if length > MAX_FETCH_BODY_BYTES {
@@ -358,6 +382,50 @@ impl WebSearchClient {
             ))])
         } else {
             Ok(vec![ContentBlock::text(text)])
+        }
+    }
+
+    // Sites behind bot protection (e.g. Akamai) 403 non-browser clients; when the
+    // user has a codex login, let OpenAI's hosted fetch (open_page) read the page
+    // from its infrastructure instead.
+    async fn fetch_with_codex_fallback(
+        &self,
+        url: &str,
+        direct_error: String,
+        max_chars: usize,
+    ) -> Result<Vec<ContentBlock>, String> {
+        let Some(token) = get_stored_codex_token().await else {
+            return Err(direct_error);
+        };
+        let model = config_param("WEBSEARCH_CODEX_MODEL")
+            .unwrap_or_else(|| CHATGPT_CODEX_DEFAULT_MODEL.to_string());
+        let text = format!(
+            "Open this URL and return its complete main text content: {}",
+            url
+        );
+        let output = codex_responses(CodexRequest {
+            client: &self.http,
+            url: CODEX_RESPONSES_URL,
+            access_token: &token.access_token,
+            account_id: token.account_id.as_deref(),
+            model: &model,
+            instructions: CODEX_FETCH_INSTRUCTIONS,
+            text,
+            deep: false,
+            num_results: DEFAULT_NUM_RESULTS,
+        })
+        .await
+        .map_err(|e| format!("{}; codex open_page fallback failed: {}", direct_error, e))?;
+
+        let answer = output.answer;
+        if answer.chars().count() > max_chars {
+            let truncated: String = answer.chars().take(max_chars).collect();
+            Ok(vec![ContentBlock::text(format!(
+                "{}\n\n(truncated to {} characters)",
+                truncated, max_chars
+            ))])
+        } else {
+            Ok(vec![ContentBlock::text(answer)])
         }
     }
 
@@ -392,6 +460,8 @@ impl WebSearchClient {
                 indoc! {r#"
                     Fetch a web page and return its content as plain text. Use this to read
                     the full content of a URL, for example a promising web_search result.
+                    When the site blocks direct fetching (e.g. 403), falls back to reading
+                    the page through the codex hosted fetch if available.
                 "#}
                 .to_string(),
                 fetch_schema_value.as_object().unwrap().clone(),
@@ -585,6 +655,21 @@ async fn search_kimi(
     })
 }
 
+const CODEX_SEARCH_INSTRUCTIONS: &str = "You are a web search assistant. Use the web_search tool to answer the user's query. Return a concise answer citing source URLs.";
+const CODEX_FETCH_INSTRUCTIONS: &str = "You are a page reader. Use the web_search tool to open the exact URL the user gives and return the page content as plain text. Do not summarize unless asked.";
+
+struct CodexRequest<'a> {
+    client: &'a reqwest::Client,
+    url: &'a str,
+    access_token: &'a str,
+    account_id: Option<&'a str>,
+    model: &'a str,
+    instructions: &'a str,
+    text: String,
+    deep: bool,
+    num_results: usize,
+}
+
 async fn search_codex(
     client: &reqwest::Client,
     url: &str,
@@ -593,12 +678,27 @@ async fn search_codex(
     model: &str,
     request: &SearchRequest,
 ) -> Result<SearchOutput> {
+    codex_responses(CodexRequest {
+        client,
+        url,
+        access_token,
+        account_id,
+        model,
+        instructions: CODEX_SEARCH_INSTRUCTIONS,
+        text: request.prompt(),
+        deep: request.deep,
+        num_results: request.num_results,
+    })
+    .await
+}
+
+async fn codex_responses(request: CodexRequest<'_>) -> Result<SearchOutput> {
     let body = json!({
-        "model": model,
-        "instructions": "You are a web search assistant. Use the web_search tool to answer the user's query. Return a concise answer citing source URLs.",
+        "model": request.model,
+        "instructions": request.instructions,
         "input": [{
             "role": "user",
-            "content": [{ "type": "input_text", "text": request.prompt() }],
+            "content": [{ "type": "input_text", "text": request.text }],
         }],
         "tools": [{
             "type": "web_search",
@@ -610,12 +710,13 @@ async fn search_codex(
         "stream": true,
     });
 
-    let mut http_request = client
-        .post(url)
-        .bearer_auth(access_token)
+    let mut http_request = request
+        .client
+        .post(request.url)
+        .bearer_auth(request.access_token)
         .json(&body)
-        .timeout(Duration::from_secs(60));
-    if let Some(account_id) = account_id {
+        .timeout(Duration::from_secs(180));
+    if let Some(account_id) = request.account_id {
         http_request = http_request.header("chatgpt-account-id", account_id);
     }
 
@@ -655,7 +756,7 @@ async fn search_openai(
         .post(format!("{}/v1/responses", base_url.trim_end_matches('/')))
         .bearer_auth(api_key)
         .json(&body)
-        .timeout(Duration::from_secs(60))
+        .timeout(Duration::from_secs(180))
         .send()
         .await?
         .error_for_status()?
@@ -1016,6 +1117,41 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(output.answer, "codex answer");
+    }
+
+    #[tokio::test]
+    async fn codex_fetch_includes_url_in_prompt() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .and(wiremock::matchers::body_string_contains(
+                "https://example.com/page"
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_string(concat!(
+                "data: {\"type\": \"response.completed\", \"response\": {\"output\": [",
+                "{\"type\": \"message\", \"content\": [{\"type\": \"output_text\", \"text\": \"page text\"}]}",
+                "]}}\n"
+            )))
+            .mount(&server)
+            .await;
+
+        let url = format!("{}/responses", server.uri());
+        let output = codex_responses(CodexRequest {
+            client: &reqwest::Client::new(),
+            url: &url,
+            access_token: "codex-token",
+            account_id: None,
+            model: "gpt-5.5",
+            instructions: CODEX_FETCH_INSTRUCTIONS,
+            text:
+                "Open this URL and return its complete main text content: https://example.com/page"
+                    .to_string(),
+            deep: false,
+            num_results: 8,
+        })
+        .await
+        .unwrap();
+        assert_eq!(output.answer, "page text");
     }
 
     #[tokio::test]

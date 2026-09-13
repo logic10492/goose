@@ -764,25 +764,35 @@ impl Provider for OpenAiProvider {
 
     async fn fetch_supported_models(&self) -> Result<Vec<String>, ProviderError> {
         if let Some(custom_models) = &self.custom_models {
-            let names: Vec<String> = custom_models.iter().map(|m| m.name.clone()).collect();
+            let configured_names: Vec<String> =
+                custom_models.iter().map(|m| m.name.clone()).collect();
             if self.dynamic_models == Some(false) {
-                return Ok(names);
+                return Ok(configured_names);
             }
             match self.fetch_models_from_api().await {
-                Ok(models) => return Ok(models),
+                Ok(mut models) => {
+                    for configured_name in configured_names {
+                        if !models.iter().any(|model| model == &configured_name) {
+                            models.push(configured_name);
+                        }
+                    }
+                    models.sort();
+                    models.dedup();
+                    Ok(models)
+                }
                 Err(e) if e.is_endpoint_not_found() => {
                     tracing::debug!(
                         "Models endpoint not implemented for provider '{}' ({}), using predefined list",
                         self.name,
                         e
                     );
-                    return Ok(names);
+                    Ok(configured_names)
                 }
-                Err(e) => return Err(e),
+                Err(e) => Err(e),
             }
+        } else {
+            self.fetch_models_from_api().await
         }
-
-        self.fetch_models_from_api().await
     }
 
     async fn stream(
@@ -1817,7 +1827,14 @@ mod tests {
         );
 
         let models = provider.fetch_supported_models().await.unwrap();
-        assert_eq!(models, vec!["model-a".to_string(), "model-b".to_string()]);
+        assert_eq!(
+            models,
+            vec![
+                "model-a".to_string(),
+                "model-b".to_string(),
+                "static-model".to_string(),
+            ]
+        );
     }
 
     use crate::base::ThinkingPreservationFormat;

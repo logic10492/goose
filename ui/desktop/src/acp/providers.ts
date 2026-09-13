@@ -87,7 +87,12 @@ function updateRequestToCreate(
     displayName: request.display_name,
     apiUrl: request.api_url,
     apiKey: request.api_key || null,
-    models: request.models,
+    models: request.models.map((model) => typeof model === 'string' ? model : ({
+      name: model.name,
+      contextLimit: model.context_limit ?? null,
+      reasoning: model.reasoning ?? null,
+      thinkingEfforts: model.thinking_efforts ?? null,
+    } as unknown as string)),
     supportsStreaming: request.supports_streaming ?? null,
     headers: request.headers ?? undefined,
     requiresAuth: request.requires_auth ?? true,

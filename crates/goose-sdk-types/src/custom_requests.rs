@@ -1185,6 +1185,38 @@ pub struct ProviderCatalogTemplateResponse {
     pub template: ProviderTemplateDto,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum CustomProviderModelDto {
+    Name(String),
+    Config {
+        name: String,
+        #[serde(
+            default,
+            rename = "contextLimit",
+            skip_serializing_if = "Option::is_none"
+        )]
+        context_limit: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning: Option<bool>,
+        #[serde(
+            default,
+            rename = "thinkingEfforts",
+            skip_serializing_if = "Option::is_none"
+        )]
+        thinking_efforts: Option<Vec<String>>,
+    },
+}
+
+impl CustomProviderModelDto {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Name(name) => name,
+            Self::Config { name, .. } => name,
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CustomProviderConfigDto {
@@ -1193,7 +1225,7 @@ pub struct CustomProviderConfigDto {
     pub display_name: String,
     pub api_url: String,
     #[serde(default)]
-    pub models: Vec<String>,
+    pub models: Vec<CustomProviderModelDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_streaming: Option<bool>,
     #[serde(default)]
@@ -1218,7 +1250,7 @@ pub struct CustomProviderUpsertDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
     #[serde(default)]
-    pub models: Vec<String>,
+    pub models: Vec<CustomProviderModelDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_streaming: Option<bool>,
     #[serde(default)]

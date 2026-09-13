@@ -423,6 +423,101 @@ mod tests {
         assert!(result_text(&result).contains("custom plugin full body"));
     }
 
+    #[tokio::test]
+    async fn shuorenhua_open_plugin_skill_is_namespaced_and_respects_enabled_state() {
+        let _guard = env_lock::lock_env([("PLUGINS", None::<&str>)]);
+        const MANIFEST: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/plugins/shuorenhua/plugin.json"
+        ));
+        const SKILL: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/plugins/shuorenhua/skills/shuorenhua/SKILL.md"
+        ));
+        const PROTECTED_SPANS: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/plugins/shuorenhua/skills/shuorenhua/references/protected-spans.md"
+        ));
+        const DESCRIPTION: &str = "检查和清理中英文文本里的 AI 套路，适用于“去 AI 味”“说人话”“自然一点”“别像模板”“先标问题”这类改写和审稿需求；按场景控制力度，同时保留事实、术语、语域和责任主体。";
+        const BODY_ANCHOR: &str = "这份 skill 不是敏感词替换器";
+        const REFERENCE_ANCHOR: &str = "# Protected Spans";
+
+        let project = TempDir::new().unwrap();
+        let plugin_dir = project.path().join(".agents/plugins/shuorenhua");
+        let skill_dir = plugin_dir.join("skills/shuorenhua");
+        fs::create_dir_all(skill_dir.join("references")).unwrap();
+        fs::write(plugin_dir.join("plugin.json"), MANIFEST).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            SKILL.replacen("name: shuorenhua", "name: shuorenhua:shuorenhua", 1),
+        )
+        .unwrap();
+        fs::write(
+            skill_dir.join("references/protected-spans.md"),
+            PROTECTED_SPANS,
+        )
+        .unwrap();
+
+        let installed_skill = fs::read_to_string(skill_dir.join("SKILL.md")).unwrap();
+        assert!(installed_skill.contains("name: shuorenhua:shuorenhua"));
+        assert!(installed_skill.contains(DESCRIPTION));
+
+        let client = test_client(project.path(), "shuorenhua", true);
+        let instructions = client.get_instructions().unwrap();
+        assert!(instructions.contains("shuorenhua:shuorenhua"));
+        assert!(instructions.contains(DESCRIPTION));
+        assert!(!instructions.contains(BODY_ANCHOR));
+
+        let ctx = ToolCallContext::new("test".to_string(), None, None);
+        let args: JsonObject = serde_json::from_value(serde_json::json!({
+            "name": "shuorenhua:shuorenhua"
+        }))
+        .unwrap();
+        let result = client
+            .call_tool(&ctx, "load_skill", Some(args), CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+        assert!(result_text(&result).contains(BODY_ANCHOR));
+
+        let args: JsonObject = serde_json::from_value(serde_json::json!({
+            "name": "shuorenhua:shuorenhua/references/protected-spans.md"
+        }))
+        .unwrap();
+        let result = client
+            .call_tool(&ctx, "load_skill", Some(args), CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+        assert!(result_text(&result).contains(REFERENCE_ANCHOR));
+
+        let disabled_client = test_client(project.path(), "shuorenhua", false);
+        assert!(disabled_client
+            .get_instructions()
+            .is_none_or(|instructions| !instructions.contains("shuorenhua:shuorenhua")));
+        let args: JsonObject = serde_json::from_value(serde_json::json!({
+            "name": "shuorenhua:shuorenhua"
+        }))
+        .unwrap();
+        let result = disabled_client
+            .call_tool(&ctx, "load_skill", Some(args), CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(result.is_error.unwrap_or(false));
+        assert!(!result_text(&result).contains(BODY_ANCHOR));
+
+        let args: JsonObject = serde_json::from_value(serde_json::json!({
+            "name": "shuorenhua:shuorenhua/references/protected-spans.md"
+        }))
+        .unwrap();
+        let result = disabled_client
+            .call_tool(&ctx, "load_skill", Some(args), CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(result.is_error.unwrap_or(false));
+        assert!(!result_text(&result).contains(REFERENCE_ANCHOR));
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn symlinked_project_plugin_supporting_file_is_loadable() {

@@ -53,6 +53,13 @@ export type ProviderDetails = {
   saved_model?: string | null;
 };
 
+export type CustomProviderModel = {
+  name: string;
+  context_limit?: number | null;
+  reasoning?: boolean | null;
+  thinking_efforts?: ThinkingEffort[] | null;
+};
+
 export type UpdateCustomProviderRequest = {
   api_key: string;
   api_url: string;
@@ -61,7 +68,7 @@ export type UpdateCustomProviderRequest = {
   display_name: string;
   engine: string;
   headers?: Record<string, string> | null;
-  models: string[];
+  models: (string | CustomProviderModel)[];
   preserves_thinking?: boolean | null;
   requires_auth?: boolean;
   supports_streaming?: boolean | null;

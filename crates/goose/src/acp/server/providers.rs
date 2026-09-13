@@ -339,8 +339,8 @@ fn normalize_custom_provider_upsert(
         .models
         .into_iter()
         .filter_map(|model| {
-            let model = model.trim().to_string();
-            (!model.is_empty()).then_some(model)
+            let name = model.name().trim().to_string();
+            (!name.is_empty()).then_some(model)
         })
         .collect();
     if provider.models.is_empty() {
@@ -380,7 +380,7 @@ fn custom_provider_headers(headers: HashMap<String, String>) -> Option<HashMap<S
 }
 
 fn custom_provider_models(
-    names: Vec<String>,
+    models: Vec<CustomProviderModelDto>,
     existing: &[ModelInfo],
     catalog_provider_id: Option<&str>,
 ) -> Vec<ModelInfo> {
@@ -389,10 +389,19 @@ fn custom_provider_models(
         .map(|template| template.models)
         .unwrap_or_default();
 
-    names
+    models
         .into_iter()
-        .map(|name| {
-            existing
+        .map(|model| {
+            let (name, context_limit, reasoning, thinking_efforts) = match model {
+                CustomProviderModelDto::Name(name) => (name, None, None, None),
+                CustomProviderModelDto::Config {
+                    name,
+                    context_limit,
+                    reasoning,
+                    thinking_efforts,
+                } => (name, context_limit, reasoning, thinking_efforts),
+            };
+            let mut info = existing
                 .iter()
                 .find(|model| model.name == name)
                 .cloned()
@@ -402,7 +411,20 @@ fn custom_provider_models(
                         .find(|model| model.id == name)
                         .map(|model| ModelInfo::new(&name).with_context_limit(model.context_limit))
                 })
-                .unwrap_or_else(|| ModelInfo::new(name))
+                .unwrap_or_else(|| ModelInfo::new(&name));
+            if let Some(limit) = context_limit {
+                info.context_limit = Some(limit);
+            }
+            if let Some(reasoning) = reasoning {
+                info.reasoning = reasoning;
+            }
+            if let Some(efforts) = thinking_efforts {
+                info.request_params = Some(HashMap::from([(
+                    "thinking_efforts".to_string(),
+                    serde_json::json!(efforts),
+                )]));
+            }
+            info
         })
         .collect()
 }
@@ -443,7 +465,25 @@ fn custom_provider_config_to_dto(
         models: config
             .models
             .iter()
-            .map(|model| model.name.clone())
+            .map(|model| {
+                if model.context_limit.is_none()
+                    && !model.reasoning
+                    && model.request_params.is_none()
+                {
+                    CustomProviderModelDto::Name(model.name.clone())
+                } else {
+                    CustomProviderModelDto::Config {
+                        name: model.name.clone(),
+                        context_limit: model.context_limit,
+                        reasoning: Some(model.reasoning),
+                        thinking_efforts: model
+                            .request_params
+                            .as_ref()
+                            .and_then(|params| params.get("thinking_efforts"))
+                            .and_then(|value| serde_json::from_value(value.clone()).ok()),
+                    }
+                }
+            })
             .collect(),
         supports_streaming: config.supports_streaming,
         headers: config.headers.clone().unwrap_or_default(),
