@@ -9,6 +9,8 @@ import {
   acpListSetupProviderDetails,
   acpRefreshProviderDetails,
   acpSetSessionProviderModel,
+  acpUpdateCustomProviderFromRequest,
+  customProviderConfigToRequest,
 } from '../providers';
 
 vi.mock('../acpConnection', () => ({
@@ -28,6 +30,84 @@ function selectConfigOption(id: string, currentValue: string) {
 describe('ACP providers', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+  });
+
+  it('preserves declared model capabilities in provider details', async () => {
+    const client = {
+      goose: {
+        providersList_unstable: vi.fn().mockResolvedValue({
+          entries: [
+            providerEntry({
+              providerId: 'custom_dahetao',
+              models: [
+                {
+                  id: 'gpt-6-astra',
+                  name: 'GPT Astra',
+                  contextLimit: 256000,
+                  reasoning: true,
+                  thinkingEfforts: ['max', 'high', 'off'],
+                },
+              ],
+            }),
+          ],
+        }),
+      },
+    };
+    vi.mocked(getAcpClient).mockResolvedValue(
+      client as unknown as Awaited<ReturnType<typeof getAcpClient>>
+    );
+    const provider = await acpGetProviderDetails('custom_dahetao');
+    expect(provider.metadata.known_models).toEqual([
+      {
+        name: 'gpt-6-astra',
+        context_limit: 256000,
+        reasoning: true,
+        thinking_efforts: ['max', 'high', 'off'],
+      },
+    ]);
+  });
+
+  it('round-trips custom model settings through the editable form request', async () => {
+    const client = { goose: { providersCustomUpdate_unstable: vi.fn().mockResolvedValue({}) } };
+    vi.mocked(getAcpClient).mockResolvedValue(
+      client as unknown as Awaited<ReturnType<typeof getAcpClient>>
+    );
+    const config = {
+      providerId: 'custom_dahetao',
+      engine: 'openai',
+      displayName: 'Dahetao',
+      apiUrl: 'https://api.dahetao.org',
+      requiresAuth: true,
+      apiKeySet: true,
+      preservesThinking: true,
+      models: [
+        'plain-model',
+        {
+          name: 'gpt-6-astra',
+          contextLimit: 256000,
+          reasoning: true,
+          thinkingEfforts: ['max', 'high', 'off'],
+        },
+      ],
+    };
+    const request = customProviderConfigToRequest(config);
+    expect(request.models[1]).toEqual({
+      name: 'gpt-6-astra',
+      context_limit: 256000,
+      reasoning: true,
+      thinking_efforts: ['max', 'high', 'off'],
+    });
+    expect(request.api_key).toBe('');
+    await acpUpdateCustomProviderFromRequest(config.providerId, request);
+    expect(client.goose.providersCustomUpdate_unstable).toHaveBeenCalledWith(
+      expect.objectContaining({
+        providerId: config.providerId,
+        apiKey: null,
+        apiUrl: config.apiUrl,
+        preservesThinking: true,
+        models: config.models,
+      })
+    );
   });
 
   it('sets thinking effort after provider and model, then returns the final config response', async () => {

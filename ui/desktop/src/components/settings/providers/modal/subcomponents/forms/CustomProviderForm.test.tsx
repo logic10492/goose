@@ -199,6 +199,54 @@ describe('CustomProviderForm transitions', () => {
     expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({ engine: expectedEngine }));
   });
 
+  it('edits and saves model capabilities without losing thinking preservation', async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn();
+    render(
+      <CustomProviderForm
+        initialData={{
+          engine: 'openai',
+          display_name: 'Dahetao',
+          api_url: 'https://api.dahetao.org',
+          api_key: '',
+          models: [
+            {
+              name: 'gpt-6-astra',
+              context_limit: 256000,
+              reasoning: true,
+              thinking_efforts: ['max', 'high', 'off'],
+            },
+          ],
+          requires_auth: true,
+          preserves_thinking: true,
+        }}
+        isEditable
+        onSubmit={onSubmit}
+        onCancel={vi.fn()}
+      />,
+      { wrapper: IntlTestWrapper }
+    );
+    expect(screen.getByLabelText('Context length (tokens)')).toHaveValue(256000);
+    expect(screen.getByRole('checkbox', { name: 'max' })).toBeChecked();
+    expect(screen.getByRole('checkbox', { name: 'low' })).not.toBeChecked();
+    await user.click(screen.getByRole('checkbox', { name: 'low' }));
+    await user.click(screen.getByRole('button', { name: 'Update Provider' }));
+    expect(onSubmit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        api_key: '',
+        preserves_thinking: true,
+        models: [
+          {
+            name: 'gpt-6-astra',
+            context_limit: 256000,
+            reasoning: true,
+            thinking_efforts: ['max', 'high', 'off', 'low'],
+          },
+        ],
+      })
+    );
+  });
+
   it('clears form validation when returning to the setup choice', async () => {
     const user = userEvent.setup();
     renderForm();

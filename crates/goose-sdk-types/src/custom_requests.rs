@@ -1770,9 +1770,12 @@ pub struct ProviderInventoryModelDto {
     /// Context window size in tokens.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_limit: Option<usize>,
-    /// Whether the model supports reasoning/extended thinking.
+    /// Whether this model supports reasoning/extended thinking.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<bool>,
+    /// Thinking effort values supported by this model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_efforts: Option<Vec<String>>,
     /// Whether this model should appear in the compact recommended picker.
     #[serde(default)]
     pub recommended: bool,

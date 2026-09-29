@@ -557,6 +557,7 @@ export const zProviderInventoryModelDto = z.object({
     family: z.string().nullish(),
     contextLimit: z.int().gte(0).nullish(),
     reasoning: z.boolean().nullish(),
+    thinkingEfforts: z.array(z.string()).nullish(),
     recommended: z.boolean().optional().default(false)
 });
 
@@ -716,6 +717,16 @@ export const zProviderCatalogTemplateResponse_unstable = z.object({
     template: zProviderTemplateDto
 });
 
+export const zCustomProviderModelDto = z.union([
+    z.string(),
+    z.object({
+        name: z.string(),
+        contextLimit: z.int().gte(0).nullish(),
+        reasoning: z.boolean().nullish(),
+        thinkingEfforts: z.array(z.string()).nullish()
+    })
+]);
+
 /**
  * Create a custom provider backed by Goose's declarative provider store.
  */
@@ -724,7 +735,7 @@ export const zCustomProviderCreateRequest_unstable = z.object({
     displayName: z.string(),
     apiUrl: z.string(),
     apiKey: z.string().nullish(),
-    models: z.array(z.string()).optional().default([]),
+    models: z.array(zCustomProviderModelDto).optional().default([]),
     supportsStreaming: z.boolean().nullish(),
     headers: z.record(z.string(), z.string()).optional().default({}),
     requiresAuth: z.boolean(),
@@ -776,7 +787,7 @@ export const zCustomProviderConfigDto = z.object({
     engine: z.string(),
     displayName: z.string(),
     apiUrl: z.string(),
-    models: z.array(z.string()).optional().default([]),
+    models: z.array(zCustomProviderModelDto).optional().default([]),
     supportsStreaming: z.boolean().nullish(),
     headers: z.record(z.string(), z.string()).optional().default({}),
     requiresAuth: z.boolean(),
@@ -802,7 +813,7 @@ export const zCustomProviderUpdateRequest_unstable = z.object({
     displayName: z.string(),
     apiUrl: z.string(),
     apiKey: z.string().nullish(),
-    models: z.array(z.string()).optional().default([]),
+    models: z.array(zCustomProviderModelDto).optional().default([]),
     supportsStreaming: z.boolean().nullish(),
     headers: z.record(z.string(), z.string()).optional().default({}),
     requiresAuth: z.boolean(),

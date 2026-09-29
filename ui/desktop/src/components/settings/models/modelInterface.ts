@@ -12,6 +12,7 @@ export default interface Model {
   subtext?: string; // goes below model name if not the provider
   context_limit?: number; // optional context limit override
   reasoning?: boolean; // optional reasoning/thinking support metadata
+  thinking_efforts?: string[] | null;
   request_params?: Record<string, unknown> & { thinking_effort?: ThinkingEffort }; // provider-specific request parameters
 }
 
@@ -48,6 +49,7 @@ export async function fetchModelsForProviders(
             provider: p.name,
             context_limit: m.contextLimit ?? undefined,
             reasoning: m.reasoning ?? undefined,
+            thinking_efforts: m.thinkingEfforts ?? undefined,
           }) as Model
       );
       return { provider: p, models, error: null, warning: null };
@@ -61,6 +63,7 @@ export async function fetchModelsForProviders(
               provider: p.name,
               context_limit: m.context_limit,
               reasoning: m.reasoning ?? undefined,
+              thinking_efforts: m.thinking_efforts ?? undefined,
             }) as Model
         );
         if (fallbackModels.length > 0) {
@@ -93,11 +96,22 @@ export async function fetchModelReasoning(
   model: string,
   fallback?: boolean
 ): Promise<boolean | null> {
+  return (await fetchModelCapabilities(provider, model, { reasoning: fallback })).reasoning ?? null;
+}
+
+export async function fetchModelCapabilities(
+  provider: string,
+  model: string,
+  fallback: Pick<Model, 'reasoning' | 'thinking_efforts'> = {}
+): Promise<Pick<Model, 'reasoning' | 'thinking_efforts'>> {
   try {
     const models = await acpListProviderModels(provider);
     const match = models.find((m) => m.id === model);
-    return match?.reasoning ?? fallback ?? null;
+    return {
+      reasoning: match?.reasoning ?? fallback.reasoning,
+      thinking_efforts: match?.thinkingEfforts ?? fallback.thinking_efforts,
+    };
   } catch {
-    return fallback ?? null;
+    return fallback;
   }
 }

@@ -19,6 +19,7 @@ export type ModelInfo = {
   name: string;
   output_token_cost?: number | null;
   reasoning?: boolean;
+  thinking_efforts?: string[] | null;
   resolved_model?: string | null;
   supports_cache_control?: boolean | null;
 };
@@ -57,7 +58,7 @@ export type CustomProviderModel = {
   name: string;
   context_limit?: number | null;
   reasoning?: boolean | null;
-  thinking_efforts?: ThinkingEffort[] | null;
+  thinking_efforts?: string[] | null;
 };
 
 export type UpdateCustomProviderRequest = {

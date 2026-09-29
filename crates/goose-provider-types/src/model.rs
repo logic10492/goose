@@ -29,6 +29,7 @@ pub fn is_goose_internal_request_param(key: &str) -> bool {
     matches!(
         key,
         "thinking_effort"
+            | "thinking_efforts"
             | "disable_prompt_cache"
             | "emit_clear_thinking"
             | "preserve_thinking_context"

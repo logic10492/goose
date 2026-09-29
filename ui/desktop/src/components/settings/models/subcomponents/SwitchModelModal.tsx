@@ -22,7 +22,7 @@ import {
 import { useModelAndProvider } from '../../../ModelAndProviderContext';
 import type { View } from '../../../../utils/navigationUtils';
 import Model, {
-  fetchModelReasoning,
+  fetchModelCapabilities,
   fetchModelsForProviders,
   getProviderMetadata,
 } from '../modelInterface';
@@ -284,6 +284,7 @@ export const SwitchModelModal = ({
     provider: string;
     isDisabled?: boolean;
     reasoning?: boolean;
+    thinking_efforts?: string[] | null;
   };
   const [modelOptions, setModelOptions] = useState<{ options: ModelOption[] }[]>([]);
   const [provider, setProvider] = useState<string | null>(
@@ -312,15 +313,34 @@ export const SwitchModelModal = ({
   const [thinkingEffort, setThinkingEffort] = useState<ThinkingEffort | null>(null);
   const [selectedModelReasoning, setSelectedModelReasoning] = useState<boolean | null>(null);
 
+  const [selectedModelThinkingEfforts, setSelectedModelThinkingEfforts] = useState<string[] | null>(
+    null
+  );
   const modelReasoning = selectedModelReasoning ?? selectedPredefinedModel?.reasoning;
-  const showThinkingControl = modelReasoning === true;
+  const supportedEfforts =
+    selectedModelThinkingEfforts ?? selectedPredefinedModel?.thinking_efforts;
+  const thinkingEffortOptions = supportedEfforts
+    ? THINKING_EFFORT_OPTIONS.filter((option) => supportedEfforts.includes(option.value))
+    : THINKING_EFFORT_OPTIONS;
+  const preferredEffort =
+    thinkingEffort ?? selectedPredefinedModel?.request_params?.thinking_effort ?? 'off';
+  const selectedEffort =
+    thinkingEffortOptions.find((option) => option.value === preferredEffort) ??
+    thinkingEffortOptions.find((option) => option.value === 'off') ??
+    thinkingEffortOptions[0];
+  const showThinkingControl = modelReasoning === true && selectedEffort !== undefined;
   const resolveSelectedModelReasoning = useCallback(
-    (providerName: string, modelName: string, fallback?: boolean) => {
+    (providerName: string, modelName: string, fallback?: boolean, efforts?: string[] | null) => {
       const requestId = ++reasoningRequestId.current;
       setSelectedModelReasoning(fallback ?? null);
-      fetchModelReasoning(providerName, modelName, fallback).then((reasoning) => {
+      setSelectedModelThinkingEfforts(efforts ?? null);
+      fetchModelCapabilities(providerName, modelName, {
+        reasoning: fallback,
+        thinking_efforts: efforts,
+      }).then((capabilities) => {
         if (requestId === reasoningRequestId.current) {
-          setSelectedModelReasoning(reasoning);
+          setSelectedModelReasoning(capabilities.reasoning ?? null);
+          setSelectedModelThinkingEfforts(capabilities.thinking_efforts ?? null);
         }
       });
     },
@@ -339,24 +359,37 @@ export const SwitchModelModal = ({
   }, []);
 
   useEffect(() => {
-    if (!provider || !model) return;
+    if (usePredefinedModels) return;
+    if (!provider || !model) {
+      ++reasoningRequestId.current;
+      setSelectedModelReasoning(null);
+      setSelectedModelThinkingEfforts(null);
+      return;
+    }
 
     const selectedOption = modelOptions
       .flatMap((group) => group.options)
       .find((option) => option.provider === provider && option.value === model);
 
     if (selectedOption) {
-      resolveSelectedModelReasoning(provider, model, selectedOption.reasoning);
+      resolveSelectedModelReasoning(
+        provider,
+        model,
+        selectedOption.reasoning,
+        selectedOption.thinking_efforts
+      );
       return;
     }
 
+    ++reasoningRequestId.current;
     setSelectedModelReasoning(null);
+    setSelectedModelThinkingEfforts(null);
     const timeout = setTimeout(() => {
       resolveSelectedModelReasoning(provider, model);
     }, 400);
 
     return () => clearTimeout(timeout);
-  }, [model, provider, modelOptions, resolveSelectedModelReasoning]);
+  }, [model, provider, modelOptions, usePredefinedModels, resolveSelectedModelReasoning]);
 
   // Validate form data
   const validateForm = useCallback(() => {
@@ -415,8 +448,8 @@ export const SwitchModelModal = ({
         reasoning: selectedModelReasoning ?? modelObj.reasoning,
       };
 
-      if (showThinkingControl) {
-        const effort = thinkingEffort ?? modelObj.request_params?.thinking_effort ?? 'off';
+      if (showThinkingControl && selectedEffort) {
+        const effort = selectedEffort.value;
         modelObj = {
           ...modelObj,
           request_params: { ...modelObj.request_params, thinking_effort: effort },
@@ -459,7 +492,8 @@ export const SwitchModelModal = ({
       resolveSelectedModelReasoning(
         matchingModel.provider,
         matchingModel.name,
-        matchingModel.reasoning
+        matchingModel.reasoning,
+        matchingModel.thinking_efforts
       );
     }
   }, [usePredefinedModels, currentModel, resolveSelectedModelReasoning]);
@@ -542,18 +576,13 @@ export const SwitchModelModal = ({
 
           const modelList = models || [];
 
-          const options: {
-            value: string;
-            label: string;
-            provider: string;
-            providerType: ProviderType;
-            reasoning?: boolean;
-          }[] = modelList.map((m) => ({
+          const options: (ModelOption & { providerType: ProviderType })[] = modelList.map((m) => ({
             value: m.name,
             label: m.name,
             provider: p.name,
             providerType: p.provider_type,
             reasoning: m.reasoning,
+            thinking_efforts: m.thinking_efforts,
           }));
 
           if (p.provider_type !== 'Custom') {
@@ -636,17 +665,17 @@ export const SwitchModelModal = ({
 
   const handlePredefinedModelChange = (model: Model) => {
     setSelectedPredefinedModel(model);
-    resolveSelectedModelReasoning(model.provider, model.name, model.reasoning);
+    resolveSelectedModelReasoning(
+      model.provider,
+      model.name,
+      model.reasoning,
+      model.thinking_efforts
+    );
   };
 
   // Handle model selection change
   const handleModelChange = (newValue: unknown) => {
-    const selectedOption = newValue as {
-      value: string;
-      label: string;
-      provider: string;
-      reasoning?: boolean;
-    } | null;
+    const selectedOption = newValue as ModelOption | null;
     if (selectedOption?.value === 'custom') {
       setIsCustomModel(true);
       setModel('');
@@ -667,7 +696,8 @@ export const SwitchModelModal = ({
         resolveSelectedModelReasoning(
           selectedOption.provider,
           selectedOption.value,
-          selectedOption.reasoning
+          selectedOption.reasoning,
+          selectedOption.thinking_efforts
         );
       } else {
         setSelectedModelReasoning(selectedOption?.reasoning ?? null);
@@ -724,12 +754,13 @@ export const SwitchModelModal = ({
 
   const thinkingEffortControl = showThinkingControl && (
     <div className="mt-2">
-      <label className="text-sm text-textSubtle mb-1 block">
+      <label htmlFor="thinking-effort" className="text-sm text-textSubtle mb-1 block">
         {intl.formatMessage(i18n.thinkingEffort)}
       </label>
       <Select
-        options={THINKING_EFFORT_OPTIONS}
-        value={THINKING_EFFORT_OPTIONS.find((o) => o.value === (thinkingEffort ?? 'off'))}
+        inputId="thinking-effort"
+        options={thinkingEffortOptions}
+        value={selectedEffort}
         onChange={(newValue: unknown) => {
           const option = newValue as { value: ThinkingEffort; label: string } | null;
           setThinkingEffort(option?.value || 'off');

@@ -116,7 +116,13 @@ impl HuggingFaceProvider {
                 api_client,
                 completions_prefix,
             )
-            .with_supports_streaming(config.supports_streaming.unwrap_or(true)),
+            .with_supports_streaming(config.supports_streaming.unwrap_or(true))
+            .with_metadata_provider(
+                config
+                    .catalog_provider_id
+                    .as_deref()
+                    .unwrap_or(huggingface_auth::HUGGINGFACE_PROVIDER_NAME),
+            ),
             custom_models,
             dynamic_models: config.dynamic_models,
         })
@@ -133,16 +139,12 @@ impl Provider for HuggingFaceProvider {
         self.inner.get_name()
     }
 
+    fn canonical_provider_name(&self) -> &str {
+        self.inner.canonical_provider_name()
+    }
+
     async fn get_context_limit(&self, model: &str, override_limit: Option<usize>) -> usize {
-        let configured_limits = self
-            .custom_models
-            .iter()
-            .flatten()
-            .filter_map(|model| model.context_limit.map(|limit| (model.name.clone(), limit)));
-        goose_providers::context_limit::ContextLimitResolver::new(self.get_name())
-            .with_configured_limits(configured_limits)
-            .resolve(model, override_limit, || async { Ok(None) })
-            .await
+        self.inner.get_context_limit(model, override_limit).await
     }
 
     async fn fetch_supported_models(&self) -> Result<Vec<String>, ProviderError> {
@@ -174,6 +176,61 @@ impl Provider for HuggingFaceProvider {
         self.inner.fetch_supported_models().await
     }
 
+    async fn fetch_supported_model_info(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+        if let Some(custom_models) = &self.custom_models {
+            if self.dynamic_models == Some(false) {
+                let mut models = Vec::with_capacity(custom_models.len());
+                for configured in custom_models {
+                    models.push(self.fetch_model_info(&configured.name).await?);
+                }
+                return Ok(models);
+            }
+        }
+
+        match self.inner.fetch_supported_model_info().await {
+            Ok(mut models) => {
+                if let Some(custom_models) = &self.custom_models {
+                    for configured in custom_models {
+                        if let Some(discovered) = models
+                            .iter_mut()
+                            .find(|model| model.name == configured.name)
+                        {
+                            *discovered = discovered.clone().merge_overrides(configured);
+                        } else {
+                            models.push(self.fetch_model_info(&configured.name).await?);
+                        }
+                    }
+                    models.sort_by(|left, right| left.name.cmp(&right.name));
+                }
+                Ok(models)
+            }
+            Err(e) if e.is_endpoint_not_found() => {
+                if let Some(custom_models) = &self.custom_models {
+                    let mut models = Vec::with_capacity(custom_models.len());
+                    for configured in custom_models {
+                        models.push(self.fetch_model_info(&configured.name).await?);
+                    }
+                    Ok(models)
+                } else {
+                    Err(e)
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn fetch_model_info(&self, model_name: &str) -> Result<ModelInfo, ProviderError> {
+        let info = self.inner.fetch_model_info(model_name).await?;
+        if let Some(configured) = self
+            .custom_models
+            .as_ref()
+            .and_then(|models| models.iter().find(|model| model.name == model_name))
+        {
+            return Ok(info.merge_overrides(configured));
+        }
+        Ok(info)
+    }
+
     async fn stream(
         &self,
         model_config: &ModelConfig,
@@ -186,7 +243,6 @@ impl Provider for HuggingFaceProvider {
             .await
     }
 }
-
 impl goose_providers::base::ProviderDescriptor for HuggingFaceProvider {
     fn metadata() -> ProviderMetadata {
         ProviderMetadata::new(
@@ -239,7 +295,8 @@ impl ProviderDef for HuggingFaceProvider {
                     huggingface_auth::HUGGINGFACE_PROVIDER_NAME.to_string(),
                     api_client,
                     String::new(),
-                ),
+                )
+                .with_metadata_provider(huggingface_auth::HUGGINGFACE_PROVIDER_NAME),
                 custom_models: None,
                 dynamic_models: None,
             })

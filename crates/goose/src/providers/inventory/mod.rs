@@ -76,6 +76,8 @@ pub struct InventoryModel {
     pub context_limit: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_efforts: Option<Vec<String>>,
     /// Whether this model should appear in the compact recommended picker.
     pub recommended: bool,
 }
@@ -847,6 +849,7 @@ impl ProviderInventoryService {
                         .map(usize::try_from)
                         .transpose()?,
                     reasoning: row.try_get("reasoning")?,
+                    thinking_efforts: None,
                     recommended: row
                         .try_get::<Option<bool>, _>("recommended")?
                         .unwrap_or(false),
@@ -1058,6 +1061,7 @@ fn enrich_model_ids_with_canonical(
                 family: None,
                 context_limit: None,
                 reasoning: None,
+                thinking_efforts: None,
                 recommended: false,
             })
             .collect();
@@ -1124,7 +1128,15 @@ fn configured_models_to_inventory(
     let mut result: Vec<InventoryModel> = Vec::new();
     let mut seen_names: HashSet<String> = HashSet::new();
     for model in models {
-        let enriched = enriched_model(provider_family, &model.name, model.context_limit);
+        let mut enriched = enriched_model(provider_family, &model.name, model.context_limit);
+        if model.reasoning {
+            enriched.reasoning = Some(true);
+        }
+        if let Some(request_params) = &model.request_params {
+            enriched.thinking_efforts = request_params
+                .get("thinking_efforts")
+                .and_then(|value| serde_json::from_value(value.clone()).ok());
+        }
         if seen_names.insert(enriched.name.clone()) {
             result.push(enriched);
         }
@@ -1162,7 +1174,15 @@ fn inventory_models_from_snapshot(
     };
 
     for configured in configured_models_to_inventory(provider_family, configured_models) {
-        if !models.iter().any(|model| model.id == configured.id) {
+        if let Some(existing) = models.iter_mut().find(|model| model.id == configured.id) {
+            if configured.reasoning == Some(true) {
+                existing.reasoning = Some(true);
+            }
+            if configured.thinking_efforts.is_some() {
+                existing.thinking_efforts = configured.thinking_efforts;
+            }
+            existing.context_limit = existing.context_limit.or(configured.context_limit);
+        } else {
             models.push(configured);
         }
     }
@@ -1200,6 +1220,7 @@ fn enriched_model(
                     && crate::providers::chatgpt_codex::is_known_reasoning_model(model_id))
                 .then_some(true)
             }),
+        thinking_efforts: None,
         recommended: false,
     }
 }
@@ -1443,6 +1464,41 @@ mod tests {
     }
 
     #[test]
+    fn inventory_preserves_declared_thinking_efforts_before_and_after_refresh() {
+        let efforts = vec!["max", "medium", "high", "low", "off"];
+        let configured = ModelInfo {
+            reasoning: true,
+            request_params: Some(HashMap::from([(
+                "thinking_efforts".to_string(),
+                serde_json::json!(efforts),
+            )])),
+            ..ModelInfo::new("gpt-6-astra").with_context_limit(256_000)
+        };
+        let snapshot = InventorySnapshot {
+            models: vec![enriched_model("openai", "gpt-6-astra", None)],
+            last_updated_at: Some(Utc::now()),
+            last_refresh_attempt_at: Some(Utc::now()),
+            last_refresh_error: None,
+        };
+
+        for (cached, supports_refresh) in [(None, false), (None, true), (Some(&snapshot), true)] {
+            let models = inventory_models_from_snapshot(
+                cached,
+                "openai",
+                std::slice::from_ref(&configured),
+                supports_refresh,
+            );
+            assert_eq!(models.len(), 1);
+            assert_eq!(models[0].reasoning, Some(true));
+            assert_eq!(models[0].context_limit, Some(256_000));
+            assert_eq!(
+                serde_json::to_value(&models[0]).unwrap()["thinkingEfforts"],
+                serde_json::json!(efforts)
+            );
+        }
+    }
+
+    #[test]
     fn inventory_ignores_stale_snapshots_for_static_providers() {
         let configured_models = [ModelInfo::new("gpt-5.6").with_context_limit(0)];
         let snapshot = InventorySnapshot {
@@ -1452,6 +1508,7 @@ mod tests {
                 family: None,
                 context_limit: None,
                 reasoning: None,
+                thinking_efforts: None,
                 recommended: false,
             }],
             last_updated_at: Some(Utc::now()),

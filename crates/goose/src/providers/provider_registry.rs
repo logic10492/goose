@@ -56,7 +56,30 @@ impl ProviderEntry {
     }
 
     pub fn normalize_model_config(&self, model: ModelConfig) -> Result<ModelConfig> {
-        crate::model_config::materialize_model_config(&self.metadata.name, model)
+        let mut model = crate::model_config::materialize_model_config(&self.metadata.name, model)?;
+        if let Some(declared) = self
+            .metadata
+            .known_models
+            .iter()
+            .find(|known| known.name == model.model_name)
+        {
+            if model.context_limit.is_none() {
+                model.context_limit = declared.context_limit;
+            }
+            if declared.reasoning {
+                model.reasoning = Some(true);
+            }
+            if let Some(supports_vision) = declared.supports_vision {
+                model.supports_vision = Some(supports_vision);
+            }
+            if let Some(request_params) = &declared.request_params {
+                let params = model.request_params.get_or_insert_with(HashMap::new);
+                for (key, value) in request_params {
+                    params.entry(key.clone()).or_insert_with(|| value.clone());
+                }
+            }
+        }
+        Ok(model)
     }
 
     pub async fn create_with_default_model(
@@ -385,6 +408,83 @@ mod tests {
             emit_clear_thinking: false,
             setup: None,
         }
+    }
+
+    #[test]
+    fn normalize_custom_model_preserves_declared_capabilities_and_selected_effort() {
+        let mut config = test_config();
+        config.models = vec![ModelInfo {
+            reasoning: true,
+            request_params: Some(HashMap::from([
+                (
+                    "thinking_efforts".to_string(),
+                    serde_json::json!(["max", "high", "off"]),
+                ),
+                ("thinking_effort".to_string(), serde_json::json!("high")),
+            ])),
+            ..ModelInfo::new("gpt-6-astra").with_context_limit(256_000)
+        }];
+        let mut registry = ProviderRegistry::new(None);
+        registry.register_with_name_and_inventory_configured::<OpenAiProviderDef, _, _, _>(
+            &config,
+            ProviderType::Custom,
+            false,
+            |_| unreachable!("constructor is not used by this test"),
+            || Ok(InventoryIdentityInput::new("custom_hf", "openai")),
+            || true,
+        );
+        let entry = registry.entries.get("custom_hf").unwrap();
+        let model = entry
+            .normalize_model_config(
+                ModelConfig::new("gpt-6-astra")
+                    .with_thinking_effort(goose_providers::thinking::ThinkingEffort::Max),
+            )
+            .unwrap();
+        assert!(model.is_reasoning_model());
+        assert_eq!(model.context_limit, Some(256_000));
+        assert_eq!(
+            model.request_param::<String>("thinking_effort").as_deref(),
+            Some("max")
+        );
+        assert_eq!(
+            model
+                .request_param::<Vec<String>>("thinking_efforts")
+                .unwrap(),
+            vec!["max", "high", "off"]
+        );
+    }
+
+    #[test]
+    fn normalize_custom_model_declared_vision_overrides_canonical_text_only_inference() {
+        let mut config = test_config();
+        config.models = vec![ModelInfo {
+            supports_vision: Some(true),
+            ..ModelInfo::new("deepseek-v4-flash")
+        }];
+        let mut registry = ProviderRegistry::new(None);
+        registry.register_with_name_and_inventory_configured::<OpenAiProviderDef, _, _, _>(
+            &config,
+            ProviderType::Custom,
+            false,
+            |_| unreachable!("constructor is not used by this test"),
+            || Ok(InventoryIdentityInput::new("custom_deepseek", "openai")),
+            || true,
+        );
+        let entry = registry.entries.get("custom_hf").unwrap();
+
+        // The canonical catalog marks deepseek-v4-flash as text-only, so the
+        // materialized config starts with supports_vision == Some(false).
+        let materialized = crate::model_config::materialize_model_config(
+            "openai",
+            ModelConfig::new("deepseek-v4-flash"),
+        )
+        .unwrap();
+        assert_eq!(materialized.supports_vision, Some(false));
+
+        let model = entry
+            .normalize_model_config(ModelConfig::new("deepseek-v4-flash"))
+            .unwrap();
+        assert_eq!(model.supports_vision, Some(true));
     }
 
     #[test]

@@ -1,5 +1,6 @@
 import type {
   CanonicalModelInfoDto,
+  CustomProviderConfigDto,
   CustomProviderCreateRequest_unstable,
   CustomProviderReadResponse_unstable,
   ProviderSecretDto,
@@ -73,9 +74,37 @@ function providerEntryToDetails(entry: ProviderInventoryEntryDto): ProviderDetai
         name: model.id,
         context_limit: model.contextLimit ?? undefined,
         reasoning: model.reasoning ?? undefined,
+        thinking_efforts: model.thinkingEfforts ?? undefined,
       })),
       setup_steps: entry.setupSteps,
     },
+  };
+}
+
+export function customProviderConfigToRequest(
+  config: CustomProviderConfigDto
+): UpdateCustomProviderRequest {
+  return {
+    engine: config.engine,
+    display_name: config.displayName,
+    api_url: config.apiUrl,
+    api_key: '',
+    base_path: config.basePath,
+    models: (config.models ?? []).map((model) =>
+      typeof model === 'string'
+        ? model
+        : {
+            name: model.name,
+            context_limit: model.contextLimit,
+            reasoning: model.reasoning,
+            thinking_efforts: model.thinkingEfforts,
+          }
+    ),
+    supports_streaming: config.supportsStreaming ?? true,
+    requires_auth: config.requiresAuth,
+    headers: config.headers,
+    catalog_provider_id: config.catalogProviderId,
+    preserves_thinking: config.preservesThinking,
   };
 }
 
@@ -87,12 +116,16 @@ function updateRequestToCreate(
     displayName: request.display_name,
     apiUrl: request.api_url,
     apiKey: request.api_key || null,
-    models: request.models.map((model) => typeof model === 'string' ? model : ({
-      name: model.name,
-      contextLimit: model.context_limit ?? null,
-      reasoning: model.reasoning ?? null,
-      thinkingEfforts: model.thinking_efforts ?? null,
-    } as unknown as string)),
+    models: request.models.map((model) =>
+      typeof model === 'string'
+        ? model
+        : {
+            name: model.name,
+            contextLimit: model.context_limit ?? null,
+            reasoning: model.reasoning ?? null,
+            thinkingEfforts: model.thinking_efforts ?? null,
+          }
+    ),
     supportsStreaming: request.supports_streaming ?? null,
     headers: request.headers ?? undefined,
     requiresAuth: request.requires_auth ?? true,

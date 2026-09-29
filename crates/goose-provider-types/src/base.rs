@@ -8,7 +8,9 @@ use std::pin::Pin;
 use tokio::sync::watch;
 
 use crate::{
-    canonical::{catalog::ProviderSetupMetadata, map_to_canonical_model, CanonicalModelRegistry},
+    canonical::{
+        catalog::ProviderSetupMetadata, map_to_canonical_model, CanonicalModelRegistry, Modality,
+    },
     conversation::{
         message::{Message, MessageContentBlock},
         token_usage::{ProviderUsage, Usage},
@@ -287,6 +289,9 @@ pub struct ModelInfo {
     pub reasoning: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_preservation_format: Option<ThinkingPreservationFormat>,
+    /// Whether this model accepts image inputs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_vision: Option<bool>,
     /// Static params merged into the request body for this model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_params: Option<HashMap<String, Value>>,
@@ -304,6 +309,7 @@ impl ModelInfo {
             supports_cache_control: None,
             reasoning: false,
             thinking_preservation_format: None,
+            supports_vision: None,
             request_params: None,
         }
     }
@@ -335,11 +341,28 @@ impl ModelInfo {
             supports_cache_control: None,
             reasoning: false,
             thinking_preservation_format: None,
+            supports_vision: None,
             request_params: None,
         }
     }
-}
 
+    pub fn merge_overrides(mut self, overrides: &Self) -> Self {
+        self.resolved_model = overrides.resolved_model.clone().or(self.resolved_model);
+        self.context_limit = overrides.context_limit.or(self.context_limit);
+        self.input_token_cost = overrides.input_token_cost.or(self.input_token_cost);
+        self.output_token_cost = overrides.output_token_cost.or(self.output_token_cost);
+        self.currency = overrides.currency.clone().or(self.currency);
+        self.supports_cache_control = overrides
+            .supports_cache_control
+            .or(self.supports_cache_control);
+        self.reasoning |= overrides.reasoning;
+        self.thinking_preservation_format = overrides
+            .thinking_preservation_format
+            .or(self.thinking_preservation_format);
+        self.supports_vision = overrides.supports_vision.or(self.supports_vision);
+        self
+    }
+}
 pub trait ProviderDescriptor {
     fn metadata() -> ProviderMetadata;
 }
@@ -364,6 +387,9 @@ pub fn model_info_for_provider_model(provider_name: &str, model_name: &str) -> M
         let (provider, model) = canonical_id.split_once('/')?;
         registry.get(provider, model)
     });
+    let has_pricing = canonical
+        .as_ref()
+        .is_some_and(|model| model.cost.input.is_some() || model.cost.output.is_some());
 
     let reasoning = canonical
         .as_ref()
@@ -374,12 +400,21 @@ pub fn model_info_for_provider_model(provider_name: &str, model_name: &str) -> M
         name: model_name.to_string(),
         resolved_model: None,
         context_limit: canonical.as_ref().map(|model| model.limit.context),
-        input_token_cost: None,
-        output_token_cost: None,
-        currency: None,
+        input_token_cost: canonical
+            .as_ref()
+            .and_then(|model| model.cost.input)
+            .map(|cost| cost / 1_000_000.0),
+        output_token_cost: canonical
+            .as_ref()
+            .and_then(|model| model.cost.output)
+            .map(|cost| cost / 1_000_000.0),
+        currency: has_pricing.then(|| "$".to_string()),
         supports_cache_control: None,
         reasoning,
         thinking_preservation_format: None,
+        supports_vision: canonical
+            .as_ref()
+            .map(|model| model.modalities.input.contains(&Modality::Image)),
         request_params: None,
     }
 }
@@ -488,6 +523,10 @@ pub trait Provider: Send + Sync {
     /// Get the name of this provider instance
     fn get_name(&self) -> &str;
 
+    fn canonical_provider_name(&self) -> &str {
+        self.get_name()
+    }
+
     fn provider_session_id(&self) -> Option<String> {
         None
     }
@@ -581,7 +620,7 @@ pub trait Provider: Send + Sync {
             ProviderError::ExecutionError(format!("Failed to load canonical registry: {}", e))
         })?;
 
-        let provider_name = self.get_name();
+        let provider_name = self.canonical_provider_name();
 
         // Get all text-capable models with their release dates
         let mut models_with_dates: Vec<(String, Option<String>)> = all_models
@@ -638,12 +677,12 @@ pub trait Provider: Send + Sync {
         &self,
         toolshim: bool,
     ) -> Result<Vec<ModelInfo>, ProviderError> {
-        Ok(self
-            .fetch_recommended_models(toolshim)
-            .await?
-            .iter()
-            .map(|model_name| model_info_for_provider_model(self.get_name(), model_name))
-            .collect())
+        let model_names = self.fetch_recommended_models(toolshim).await?;
+        let mut models = Vec::with_capacity(model_names.len());
+        for model_name in model_names {
+            models.push(self.fetch_model_info(&model_name).await?);
+        }
+        Ok(models)
     }
 
     async fn map_to_canonical_model(
@@ -655,7 +694,7 @@ pub trait Provider: Send + Sync {
         })?;
 
         Ok(map_to_canonical_model(
-            self.get_name(),
+            self.canonical_provider_name(),
             provider_model,
             registry,
         ))
@@ -1073,6 +1112,7 @@ mod tests {
             supports_cache_control: None,
             reasoning: false,
             thinking_preservation_format: None,
+            supports_vision: None,
             request_params: None,
         };
         assert_eq!(info.context_limit, Some(1000));
@@ -1088,6 +1128,7 @@ mod tests {
             supports_cache_control: None,
             reasoning: false,
             thinking_preservation_format: None,
+            supports_vision: None,
             request_params: None,
         };
         assert_eq!(info, info2);
@@ -1103,6 +1144,7 @@ mod tests {
             supports_cache_control: None,
             reasoning: false,
             thinking_preservation_format: None,
+            supports_vision: None,
             request_params: None,
         };
         assert_ne!(info, info3);
@@ -1115,6 +1157,7 @@ mod tests {
                 "name": "zai-glm-4.7",
                 "context_limit": 131072,
                 "thinking_preservation_format": "content_xml",
+                "supports_vision": true,
                 "request_params": {"reasoning_format": "parsed"}
             }"#,
         )
@@ -1129,10 +1172,13 @@ mod tests {
             Some(&serde_json::json!("parsed"))
         );
 
+        assert_eq!(info.supports_vision, Some(true));
+
         let bare: ModelInfo =
             serde_json::from_str(r#"{"name": "gpt-4o", "context_limit": 128000}"#).unwrap();
         assert_eq!(bare.thinking_preservation_format, None);
         assert_eq!(bare.request_params, None);
+        assert_eq!(bare.supports_vision, None);
     }
 
     #[test]
@@ -1144,4 +1190,14 @@ mod tests {
         assert_eq!(info.output_token_cost, Some(0.00001));
         assert_eq!(info.currency, Some("$".to_string()));
     }
+}
+
+#[test]
+fn model_info_uses_canonical_context_reasoning_and_pricing() {
+    let info = model_info_for_provider_model("openai", "gpt-4o");
+    assert_eq!(info.context_limit, Some(128_000));
+    assert!(!info.reasoning);
+    assert!(info.input_token_cost.is_some());
+    assert!(info.output_token_cost.is_some());
+    assert_eq!(info.currency.as_deref(), Some("$"));
 }

@@ -7,6 +7,7 @@ use crate::formats::openai::{
 };
 use crate::mcp_utils::extract_text_from_resource;
 use crate::model::ModelConfig;
+use crate::thinking::ThinkingEffort;
 use crate::utils::{sanitize_unicode_tags, strip_unicode_tags};
 use anyhow::{anyhow, Error};
 use async_stream::try_stream;
@@ -645,22 +646,24 @@ pub fn create_responses_request_for_model(
     // All models routed here are responses-capable; temperature is rejected
     // by the API for reasoning models regardless of whether an explicit
     // effort suffix was provided.
-    let is_reasoning_model = is_openai_responses_model(&model_name);
+    let is_reasoning_model =
+        model_config.is_reasoning_model() || is_openai_responses_model(&model_name);
     let reasoning_effort = if is_reasoning_model {
         if let Some(effort) = legacy_reasoning_effort.as_deref() {
             if effort.eq_ignore_ascii_case("none") {
                 legacy_reasoning_effort
-            } else {
-                effort
-                    .parse()
-                    .ok()
-                    .and_then(|effort| openai_reasoning_effort_for_thinking(&model_name, effort))
+            } else if let Ok(effort) = effort.parse() {
+                responses_reasoning_effort(model_config, &model_name, effort)?
                     .or(legacy_reasoning_effort)
+            } else {
+                legacy_reasoning_effort
             }
         } else {
             model_config
                 .thinking_effort()
-                .and_then(|effort| openai_reasoning_effort_for_thinking(&model_name, effort))
+                .map(|effort| responses_reasoning_effort(model_config, &model_name, effort))
+                .transpose()?
+                .flatten()
         }
     } else {
         None
@@ -743,6 +746,29 @@ pub fn create_responses_request_for_model(
     }
 
     Ok(payload)
+}
+
+fn responses_reasoning_effort(
+    model_config: &ModelConfig,
+    model_name: &str,
+    effort: ThinkingEffort,
+) -> anyhow::Result<Option<String>> {
+    let Some(configured) = model_config.request_param::<Vec<String>>("thinking_efforts") else {
+        return Ok(openai_reasoning_effort_for_thinking(model_name, effort));
+    };
+    if !configured
+        .iter()
+        .any(|value| value.parse::<ThinkingEffort>() == Ok(effort))
+    {
+        return Err(anyhow!(
+            "Thinking effort '{effort}' is not supported by {model_name}"
+        ));
+    }
+    Ok(Some(match effort {
+        ThinkingEffort::Off => "none".to_string(),
+        ThinkingEffort::Max => "xhigh".to_string(),
+        _ => effort.to_string(),
+    }))
 }
 
 fn sanitize_tool_arguments(value: Value) -> anyhow::Result<Value> {
@@ -1966,6 +1992,58 @@ mod tests {
         assert_eq!(result["model"], "gpt-5.6-sol");
         assert_eq!(result["reasoning"]["effort"], "xhigh");
         assert_eq!(result["reasoning"]["summary"], "auto");
+    }
+
+    #[test]
+    fn test_responses_request_uses_declared_reasoning_efforts() {
+        for (effort, expected) in [
+            (ThinkingEffort::Off, "none"),
+            (ThinkingEffort::Low, "low"),
+            (ThinkingEffort::Medium, "medium"),
+            (ThinkingEffort::High, "high"),
+            (ThinkingEffort::Max, "xhigh"),
+        ] {
+            let mut config = ModelConfig::new("gpt-6-astra")
+                .with_thinking_effort(effort)
+                .with_merged_request_params(std::collections::HashMap::from([(
+                    "thinking_efforts".to_string(),
+                    json!(["max", "medium", "high", "low", "off"]),
+                )]));
+            config.reasoning = Some(true);
+            config.temperature = Some(0.7);
+            let request = create_responses_request(&config, "You are helpful.", &[], &[]).unwrap();
+
+            assert_eq!(request["model"], "gpt-6-astra");
+            assert_eq!(request["reasoning"]["effort"], expected);
+            assert_eq!(request["reasoning"]["summary"], "auto");
+            assert!(request.get("temperature").is_none());
+            assert!(request.get("thinking_efforts").is_none());
+            assert!(request.get("thinking_effort").is_none());
+        }
+    }
+
+    #[test]
+    fn test_responses_request_rejects_effort_outside_declared_list() {
+        let mut config = ModelConfig::new("custom-reasoner")
+            .with_thinking_effort(ThinkingEffort::Max)
+            .with_merged_request_params(std::collections::HashMap::from([(
+                "thinking_efforts".to_string(),
+                json!(["low", "high"]),
+            )]));
+        config.reasoning = Some(true);
+        let error = create_responses_request(&config, "", &[], &[]).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Thinking effort 'max' is not supported"));
+    }
+
+    #[test]
+    fn test_responses_request_declared_reasoning_without_effort_list() {
+        let mut config =
+            ModelConfig::new("custom-reasoner").with_thinking_effort(ThinkingEffort::High);
+        config.reasoning = Some(true);
+        let request = create_responses_request(&config, "", &[], &[]).unwrap();
+        assert_eq!(request["reasoning"]["effort"], "high");
     }
 
     #[test]

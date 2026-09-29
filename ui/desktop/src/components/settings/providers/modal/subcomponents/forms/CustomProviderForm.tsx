@@ -3,7 +3,10 @@ import { Input } from '../../../../../ui/input';
 import { Select } from '../../../../../ui/Select';
 import { Button } from '../../../../../ui/button';
 import { SecureStorageNotice } from '../SecureStorageNotice';
-import type { CustomProviderModel, UpdateCustomProviderRequest } from '../../../../../../types/providers';
+import type {
+  CustomProviderModel,
+  UpdateCustomProviderRequest,
+} from '../../../../../../types/providers';
 import type { ProviderTemplateDto } from '@aaif/goose-sdk';
 import { Plus, X, Trash2, AlertTriangle, ExternalLink, Search, Settings } from 'lucide-react';
 import { cn } from '../../../../../../utils';
@@ -308,11 +311,19 @@ export default function CustomProviderForm({
       setDisplayName(initialData.display_name);
       setApiUrl(initialData.api_url);
       setBasePath(initialData.base_path ?? '');
-      setModels(initialData.models.map((model) => typeof model === 'string' ? model : model.name).join(', '));
-      setModelSettings(Object.fromEntries(initialData.models.map((model) => {
-        const entry = typeof model === 'string' ? { name: model } : model;
-        return [entry.name, entry];
-      })));
+      setModels(
+        initialData.models
+          .map((model) => (typeof model === 'string' ? model : model.name))
+          .join(', ')
+      );
+      setModelSettings(
+        Object.fromEntries(
+          initialData.models.map((model) => {
+            const entry = typeof model === 'string' ? { name: model } : model;
+            return [entry.name, entry];
+          })
+        )
+      );
       setSupportsStreaming(initialData.supports_streaming ?? true);
       setRequiresAuth(initialData.requires_auth ?? true);
 
@@ -502,6 +513,7 @@ export default function CustomProviderForm({
         catalog_provider_id:
           selectedTemplate?.providerId ?? initialData?.catalog_provider_id ?? undefined,
         base_path: basePath || undefined,
+        preserves_thinking: initialData?.preserves_thinking,
       });
     } catch (error) {
       if (contextVersionRef.current !== contextVersion) return;
@@ -816,24 +828,60 @@ export default function CustomProviderForm({
               {validationErrors.models}
             </p>
           )}
-          {[...new Set(models.split(',').map((name) => name.trim()).filter(Boolean))].map((name) => (
+          {[
+            ...new Set(
+              models
+                .split(',')
+                .map((name) => name.trim())
+                .filter(Boolean)
+            ),
+          ].map((name) => (
             <fieldset key={name} className="mt-3 space-y-2 rounded border border-border p-3">
               <legend>{name}</legend>
               <label className="block text-sm">
                 Context length (tokens)
-                <Input type="number" min={1} step={1} value={modelSettings[name]?.context_limit ?? ''}
-                  onChange={(event) => setModelSettings((current) => ({ ...current, [name]: { ...current[name], name, context_limit: event.target.value ? Number(event.target.value) : null } }))} />
+                <Input
+                  type="number"
+                  min={1}
+                  step={1}
+                  value={modelSettings[name]?.context_limit ?? ''}
+                  onChange={(event) =>
+                    setModelSettings((current) => ({
+                      ...current,
+                      [name]: {
+                        ...current[name],
+                        name,
+                        context_limit: event.target.value ? Number(event.target.value) : null,
+                      },
+                    }))
+                  }
+                />
               </label>
               <div className="text-sm">Allowed thinking strengths</div>
               <div className="flex gap-3">
                 {(['off', 'low', 'medium', 'high', 'max'] as const).map((effort) => (
                   <label key={effort} className="flex gap-1 text-sm">
-                    <input type="checkbox" checked={modelSettings[name]?.thinking_efforts?.includes(effort) ?? false}
-                      onChange={(event) => setModelSettings((current) => {
-                        const efforts = current[name]?.thinking_efforts ?? [];
-                        const next = event.target.checked ? [...efforts, effort] : efforts.filter((value) => value !== effort);
-                        return { ...current, [name]: { ...current[name], name, reasoning: next.some((value) => value !== 'off'), thinking_efforts: next } };
-                      })} />
+                    <input
+                      type="checkbox"
+                      checked={modelSettings[name]?.thinking_efforts?.includes(effort) ?? false}
+                      onChange={(event) =>
+                        setModelSettings((current) => {
+                          const efforts = current[name]?.thinking_efforts ?? [];
+                          const next = event.target.checked
+                            ? [...efforts, effort]
+                            : efforts.filter((value) => value !== effort);
+                          return {
+                            ...current,
+                            [name]: {
+                              ...current[name],
+                              name,
+                              reasoning: next.some((value) => value !== 'off'),
+                              thinking_efforts: next,
+                            },
+                          };
+                        })
+                      }
+                    />
                     {effort}
                   </label>
                 ))}

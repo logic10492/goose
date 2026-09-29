@@ -932,9 +932,13 @@ export type ProviderInventoryModelDto = {
      */
     contextLimit?: number | null;
     /**
-     * Whether the model supports reasoning/extended thinking.
+     * Whether this model supports reasoning/extended thinking.
      */
     reasoning?: boolean | null;
+    /**
+     * Thinking effort values supported by this model.
+     */
+    thinkingEfforts?: Array<string> | null;
     /**
      * Whether this model should appear in the compact recommended picker.
      */
@@ -1065,7 +1069,7 @@ export type CustomProviderCreateRequest_unstable = {
     displayName: string;
     apiUrl: string;
     apiKey?: string | null;
-    models?: Array<string>;
+    models?: Array<CustomProviderModelDto>;
     supportsStreaming?: boolean | null;
     headers?: {
         [key: string]: string;
@@ -1074,6 +1078,13 @@ export type CustomProviderCreateRequest_unstable = {
     catalogProviderId?: string | null;
     basePath?: string | null;
     preservesThinking?: boolean | null;
+};
+
+export type CustomProviderModelDto = string | {
+    name: string;
+    contextLimit?: number | null;
+    reasoning?: boolean | null;
+    thinkingEfforts?: Array<string> | null;
 };
 
 export type CustomProviderCreateResponse_unstable = {
@@ -1126,7 +1137,7 @@ export type CustomProviderConfigDto = {
     engine: string;
     displayName: string;
     apiUrl: string;
-    models?: Array<string>;
+    models?: Array<CustomProviderModelDto>;
     supportsStreaming?: boolean | null;
     headers?: {
         [key: string]: string;
@@ -1148,7 +1159,7 @@ export type CustomProviderUpdateRequest_unstable = {
     displayName: string;
     apiUrl: string;
     apiKey?: string | null;
-    models?: Array<string>;
+    models?: Array<CustomProviderModelDto>;
     supportsStreaming?: boolean | null;
     headers?: {
         [key: string]: string;

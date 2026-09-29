@@ -9,6 +9,7 @@ import {
   acpGetCustomProvider,
   acpDeleteCustomProvider,
   acpUpdateCustomProviderFromRequest,
+  customProviderConfigToRequest,
 } from '../../../acp/providers';
 import { Plus, Search } from 'lucide-react';
 import { Input } from '../../ui/input';
@@ -287,23 +288,10 @@ function ProviderCards({
     providerCards.length === 1 &&
     (Array.isArray(providers) ? providers.length : 0) > 0;
 
-  const initialData = editingProvider && {
-    engine: editingProvider.config.engine,
-    display_name: editingProvider.config.displayName,
-    api_url: editingProvider.config.apiUrl,
-    base_path: editingProvider.config.basePath ?? undefined,
-    api_key: '',
-    models: (editingProvider.config.models ?? []) as unknown as Array<{
-      name: string;
-      contextLimit?: number | null;
-      reasoning?: boolean | null;
-      thinkingEfforts?: string[] | null;
-    } | string>,
-    supports_streaming: editingProvider.config.supportsStreaming ?? true,
-    requires_auth: editingProvider.config.requiresAuth ?? true,
-    headers: editingProvider.config.headers ?? undefined,
-    catalog_provider_id: editingProvider.config.catalogProviderId ?? undefined,
-  };
+  const initialData = useMemo(
+    () => editingProvider && customProviderConfigToRequest(editingProvider.config),
+    [editingProvider]
+  );
 
   const editable = editingProvider ? editingProvider.isEditable : true;
   const title = editingProvider

@@ -551,6 +551,7 @@ mod tests {
                     family: None,
                     context_limit: None,
                     reasoning: None,
+                    thinking_efforts: None,
                     recommended: false,
                 })
                 .collect(),
@@ -737,6 +738,42 @@ mod tests {
             provider_options,
             &ThinkingEffortSupport::Unspecified,
         )
+    }
+
+    #[test]
+    fn test_build_config_options_preserves_custom_model_effort_menu() {
+        let mut model = ModelConfig::new("gpt-6-astra")
+            .with_thinking_effort(ThinkingEffort::Max)
+            .with_merged_request_params(std::collections::HashMap::from([(
+                "thinking_efforts".to_string(),
+                serde_json::json!(["max", "medium", "high", "low", "off"]),
+            )]));
+        model.reasoning = Some(true);
+        let options = build_config_options(
+            &build_mode_state(GooseMode::Auto).unwrap(),
+            &model_selection("gpt-6-astra", &["gpt-6-astra"]),
+            &model,
+            "custom_dahetao",
+            vec![SessionConfigSelectOption::new("custom_dahetao", "Dahetao")],
+            &ThinkingEffortSupport::Unspecified,
+        );
+        let option = options
+            .iter()
+            .find(|option| option.id.0.as_ref() == "thinking_effort")
+            .unwrap();
+        let SessionConfigKind::Select(select) = &option.kind else {
+            panic!("thinking_effort should be a select option");
+        };
+        assert_eq!(select.current_value.0.as_ref(), "max");
+        assert_eq!(
+            select.options,
+            agent_client_protocol::schema::v1::SessionConfigSelectOptions::Ungrouped(
+                ["max", "medium", "high", "low", "off"]
+                    .into_iter()
+                    .map(|value| SessionConfigSelectOption::new(value, value))
+                    .collect()
+            )
+        );
     }
 
     #[test]

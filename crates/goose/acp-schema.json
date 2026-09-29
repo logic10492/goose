@@ -1852,7 +1852,17 @@
             "boolean",
             "null"
           ],
-          "description": "Whether the model supports reasoning/extended thinking."
+          "description": "Whether this model supports reasoning/extended thinking."
+        },
+        "thinkingEfforts": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "description": "Thinking effort values supported by this model."
         },
         "recommended": {
           "type": "boolean",
@@ -2269,7 +2279,7 @@
         "models": {
           "type": "array",
           "items": {
-            "type": "string"
+            "$ref": "#/$defs/CustomProviderModelDto"
           },
           "default": []
         },
@@ -2317,6 +2327,46 @@
       "description": "Create a custom provider backed by Goose's declarative provider store.",
       "x-side": "agent",
       "x-method": "_goose/unstable/providers/custom/create"
+    },
+    "CustomProviderModelDto": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "contextLimit": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "reasoning": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "thinkingEfforts": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "name"
+          ]
+        }
+      ]
     },
     "CustomProviderCreateResponse_unstable": {
       "type": "object",
@@ -2457,7 +2507,7 @@
         "models": {
           "type": "array",
           "items": {
-            "type": "string"
+            "$ref": "#/$defs/CustomProviderModelDto"
           },
           "default": []
         },
@@ -2536,7 +2586,7 @@
         "models": {
           "type": "array",
           "items": {
-            "type": "string"
+            "$ref": "#/$defs/CustomProviderModelDto"
           },
           "default": []
         },

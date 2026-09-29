@@ -2,6 +2,7 @@ use super::api_client::ApiClient;
 use super::base::{ConfigKey, ModelInfo, Provider, ProviderMetadata};
 use super::retry::ProviderRetry;
 use crate::api_client::{AuthMethod, TlsConfig};
+use crate::base::{model_info_for_provider_model, MessageStream, ProviderDescriptor};
 use crate::conversation::message::Message;
 use crate::conversation::token_usage::{CostSource, ProviderUsage};
 use crate::declarative::{DeclarativeProviderConfig, KeyResolver};
@@ -17,22 +18,24 @@ use crate::formats::openai_responses::{
 };
 use crate::http_status::read_json_response;
 use crate::images::ImageFormat;
+use crate::model::ModelConfig;
 use crate::openai_compatible::{
-    handle_response_openai_compat, handle_status, stream_openai_compat, stream_responses_compat,
+    fetch_openai_compatible_model_info, fetch_openai_compatible_model_info_for_model,
+    handle_status, model_endpoint_paths, stream_openai_compat, stream_responses_compat,
+};
+#[cfg(test)]
+use crate::openai_compatible::{
+    fetch_openai_compatible_models, parse_model_ids as parse_model_ids_shared,
 };
 use crate::request_log::{start_log, LoggerHandleExt};
 use crate::thinking::ThinkingEffort;
 use anyhow::Result;
 use async_trait::async_trait;
-use reqwest::StatusCode;
+use rmcp::model::Tool;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-
-use crate::base::{MessageStream, ProviderDescriptor};
-use crate::model::ModelConfig;
-use rmcp::model::Tool;
 
 pub const OPEN_AI_PROVIDER_NAME: &str = "openai";
 pub const OPEN_AI_DEFAULT_BASE_PATH: &str = "v1/chat/completions";
@@ -126,6 +129,13 @@ pub fn ensure_url_scheme(raw_url: &str) -> String {
     format!("{}://{}", scheme, trimmed)
 }
 
+pub fn is_codex_compatible_endpoint(raw_url: &str) -> bool {
+    url::Url::parse(&ensure_url_scheme(raw_url))
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|host| host == "api.dahetao.org")
+}
+
 pub fn parse_openai_base_url(raw_url: &str) -> Result<OpenAiBaseUrlParts> {
     let raw_url = ensure_url_scheme(raw_url);
     let raw_url = raw_url.as_str();
@@ -167,8 +177,12 @@ pub struct OpenAiProvider {
     dynamic_models: Option<bool>,
     skip_canonical_filtering: bool,
     preserve_thinking_context: bool,
+    codex_compatible: bool,
+    metadata_provider: String,
     #[serde(skip)]
     n_ctx_cache: Arc<Mutex<HashMap<String, CachedContextLimit>>>,
+    #[serde(skip)]
+    model_info_cache: Arc<Mutex<HashMap<String, ModelInfo>>>,
 }
 
 /// Builder for [`OpenAiProvider`].
@@ -188,6 +202,8 @@ pub struct OpenAiProviderBuilder {
     dynamic_models: Option<bool>,
     skip_canonical_filtering: bool,
     preserve_thinking_context: bool,
+    codex_compatible: bool,
+    metadata_provider: Option<String>,
 }
 
 impl OpenAiProviderBuilder {
@@ -204,6 +220,8 @@ impl OpenAiProviderBuilder {
             dynamic_models: None,
             skip_canonical_filtering: false,
             preserve_thinking_context: false,
+            codex_compatible: false,
+            metadata_provider: None,
         }
     }
 
@@ -275,6 +293,18 @@ impl OpenAiProviderBuilder {
         self
     }
 
+    pub fn codex_compatible(mut self, codex_compatible: bool) -> Self {
+        self.codex_compatible = codex_compatible;
+        self
+    }
+
+    pub fn metadata_provider(mut self, provider: impl Into<String>) -> Self {
+        self.metadata_provider = Some(provider.into());
+        self
+    }
+}
+
+impl OpenAiProviderBuilder {
     pub fn build(self) -> OpenAiProvider {
         OpenAiProvider {
             api_client: self.api_client,
@@ -288,7 +318,12 @@ impl OpenAiProviderBuilder {
             dynamic_models: self.dynamic_models,
             skip_canonical_filtering: self.skip_canonical_filtering,
             preserve_thinking_context: self.preserve_thinking_context,
+            codex_compatible: self.codex_compatible,
+            metadata_provider: self
+                .metadata_provider
+                .unwrap_or_else(|| OPEN_AI_PROVIDER_NAME.to_string()),
             n_ctx_cache: Arc::new(Mutex::new(HashMap::new())),
+            model_info_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -387,8 +422,30 @@ impl OpenAiProvider {
             dynamic_models: None,
             skip_canonical_filtering: false,
             preserve_thinking_context: false,
+            codex_compatible: false,
+            metadata_provider: OPEN_AI_PROVIDER_NAME.to_string(),
             n_ctx_cache: Arc::new(Mutex::new(HashMap::new())),
+            model_info_cache: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    fn cache_model_info(&self, models: &[ModelInfo]) {
+        if let Ok(mut cache) = self.model_info_cache.lock() {
+            for model in models {
+                cache.insert(model.name.clone(), model.clone());
+            }
+        }
+    }
+
+    fn cached_model_info(&self, model_name: &str) -> Option<ModelInfo> {
+        self.model_info_cache.lock().ok().and_then(|cache| {
+            cache.get(model_name).cloned().or_else(|| {
+                cache
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(model_name))
+                    .map(|(_, model)| model.clone())
+            })
+        })
     }
 
     fn normalize_base_path(base_path: &str) -> String {
@@ -409,8 +466,8 @@ impl OpenAiProvider {
         normalized.ends_with("responses") || normalized.contains("/responses")
     }
 
-    fn is_responses_model(model_name: &str) -> bool {
-        is_openai_responses_model(model_name)
+    fn is_responses_model(&self, model_name: &str) -> bool {
+        self.codex_compatible || is_openai_responses_model(model_name)
     }
 
     fn should_use_responses_api(model_name: &str, base_path: &str) -> bool {
@@ -431,7 +488,7 @@ impl OpenAiProvider {
             }
         }
 
-        Self::is_responses_model(model_name)
+        is_openai_responses_model(model_name)
     }
 
     /// Providers known to reject `max_completion_tokens` and require
@@ -494,7 +551,7 @@ impl OpenAiProvider {
 
             if Self::PROVIDERS_NEEDING_STANDARD_CHAT_PARAMS.contains(&self.name.as_str()) {
                 let model_name = obj.get("model").and_then(|model| model.as_str());
-                if !model_name.is_some_and(Self::is_responses_model) {
+                if !model_name.is_some_and(|name| self.is_responses_model(name)) {
                     obj.remove("reasoning_effort");
                 }
 
@@ -530,6 +587,9 @@ impl OpenAiProvider {
     }
 
     fn should_use_responses_api_for_provider(&self, model_name: &str) -> bool {
+        if self.codex_compatible {
+            return true;
+        }
         if Self::PROVIDERS_NEEDING_STANDARD_CHAT_PARAMS.contains(&self.name.as_str()) {
             return false;
         }
@@ -558,34 +618,12 @@ impl OpenAiProvider {
         }
     }
 
+    #[cfg(test)]
     async fn fetch_models_from_api(&self) -> Result<Vec<String>, ProviderError> {
         let models_path =
             Self::map_base_path(&self.base_path, "models", OPEN_AI_DEFAULT_MODELS_PATH);
-        let response = self.api_client.request(&models_path).response_get().await?;
-
-        if response.status() == StatusCode::NOT_FOUND {
-            let body = response.text().await.unwrap_or_default();
-            return Err(ProviderError::EndpointNotFound(body));
-        }
-
-        let response = handle_status(response).await?;
-
-        let body = response.bytes().await.map_err(|e| {
-            ProviderError::NetworkError(format!("Failed to read response body: {}", e))
-        })?;
-        let json: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
-            ProviderError::EndpointNotFound(format!("Response body is not valid JSON: {}", e))
-        })?;
-
-        if let Some(err_obj) = json.get("error").filter(|error| !error.is_null()) {
-            let msg = err_obj
-                .get("message")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown error");
-            return Err(ProviderError::Authentication(msg.to_string()));
-        }
-
-        parse_model_ids(&json)
+        let paths = model_endpoint_paths(&self.api_client, &models_path);
+        fetch_openai_compatible_models(&self.api_client, &paths).await
     }
 
     /// llama.cpp and Ollama expose the actual allocated context window in the
@@ -594,41 +632,24 @@ impl OpenAiProvider {
     async fn fetch_n_ctx_from_api(&self, model_name: &str) -> Result<Option<usize>, ProviderError> {
         let models_path =
             Self::map_base_path(&self.base_path, "models", OPEN_AI_DEFAULT_MODELS_PATH);
-        let response = self.api_client.request(&models_path).response_get().await?;
-        if response.status() == StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        let json = handle_response_openai_compat(response).await.map_err(|error| {
-            if matches!(&error, ProviderError::RequestFailed(message) if message.contains("not valid JSON")) {
-                ProviderError::EndpointNotFound(error.to_string())
-            } else {
-                error
-            }
-        })?;
-        Ok(parse_n_ctx_from_models(&json, model_name))
+        let paths = model_endpoint_paths(&self.api_client, &models_path);
+        Ok(
+            fetch_openai_compatible_model_info_for_model(&self.api_client, &paths, model_name)
+                .await?
+                .and_then(|model| model.context_limit),
+        )
     }
 }
 
+#[cfg(test)]
 fn parse_model_ids(json: &serde_json::Value) -> Result<Vec<String>, ProviderError> {
-    let models = json
-        .get("data")
-        .and_then(|value| value.as_array())
-        .or_else(|| json.as_array())
-        .ok_or_else(|| {
-            ProviderError::RequestFailed("Missing models array in JSON response".into())
-        })?;
-    let mut model_ids: Vec<String> = models
-        .iter()
-        .filter_map(|m| m.get("id").and_then(|v| v.as_str()).map(str::to_string))
-        .collect();
-    model_ids.sort();
-    Ok(model_ids)
+    parse_model_ids_shared(json)
 }
 
 /// Extract `meta.n_ctx` for `model_name` from a `/v1/models` response body.
+#[cfg(test)]
 fn parse_n_ctx_from_models(json: &serde_json::Value, model_name: &str) -> Option<usize> {
     let data = json.get("data")?.as_array()?;
-
     let n_ctx = |entry: &serde_json::Value| -> Option<usize> {
         entry
             .get("meta")?
@@ -636,17 +657,12 @@ fn parse_n_ctx_from_models(json: &serde_json::Value, model_name: &str) -> Option
             .as_u64()
             .map(|v| v as usize)
     };
-
     if let Some(entry) = data
         .iter()
         .find(|e| e.get("id").and_then(|v| v.as_str()) == Some(model_name))
     {
         return n_ctx(entry);
     }
-
-    // For single-model servers without --alias, llama.cpp reports the loaded model
-    // file path as id rather than the client's alias, so no entry matches above.
-    // Fall back to the sole entry's n_ctx.
     match data.as_slice() {
         [only] => n_ctx(only),
         _ => None,
@@ -704,6 +720,10 @@ impl Provider for OpenAiProvider {
         &self.name
     }
 
+    fn canonical_provider_name(&self) -> &str {
+        &self.metadata_provider
+    }
+
     async fn refresh_credentials(&self) -> Result<(), ProviderError> {
         self.api_client
             .refresh_credentials()
@@ -721,11 +741,18 @@ impl Provider for OpenAiProvider {
             .iter()
             .flatten()
             .filter_map(|model| model.context_limit.map(|limit| (model.name.clone(), limit)));
-        let resolver = goose_provider_types::context_limit::ContextLimitResolver::new(&self.name)
-            .with_configured_limits(configured_limits);
+        let resolver =
+            goose_provider_types::context_limit::ContextLimitResolver::new(&self.metadata_provider)
+                .with_configured_limits(configured_limits);
 
         resolver
             .resolve(model, override_limit, || async {
+                if let Some(limit) = self
+                    .cached_model_info(model)
+                    .and_then(|info| info.context_limit)
+                {
+                    return Ok(Some(limit));
+                }
                 if let Some(cached) = self
                     .n_ctx_cache
                     .lock()
@@ -736,19 +763,13 @@ impl Provider for OpenAiProvider {
                     return Ok(cached);
                 }
 
-                let probed = match tokio::time::timeout(
-                    N_CTX_PROBE_TIMEOUT,
-                    self.fetch_n_ctx_from_api(model),
-                )
-                .await
-                {
-                    Ok(Ok(limit)) => Ok(limit),
-                    Ok(Err(error)) if error.is_endpoint_not_found() => Ok(None),
-                    Ok(Err(error)) => Err(error),
-                    Err(_) => Err(ProviderError::RequestFailed(
-                        "Context-limit discovery timed out".into(),
-                    )),
-                };
+                let probed =
+                    tokio::time::timeout(N_CTX_PROBE_TIMEOUT, self.fetch_n_ctx_from_api(model))
+                        .await
+                        .map_err(|_| {
+                            ProviderError::RequestFailed("Context-limit discovery timed out".into())
+                        })
+                        .and_then(|result| result);
 
                 if let Ok(mut cache) = self.n_ctx_cache.lock() {
                     let cached = match probed.as_ref() {
@@ -763,36 +784,84 @@ impl Provider for OpenAiProvider {
     }
 
     async fn fetch_supported_models(&self) -> Result<Vec<String>, ProviderError> {
+        Ok(self
+            .fetch_supported_model_info()
+            .await?
+            .into_iter()
+            .map(|model| model.name)
+            .collect())
+    }
+
+    async fn fetch_supported_model_info(&self) -> Result<Vec<ModelInfo>, ProviderError> {
         if let Some(custom_models) = &self.custom_models {
-            let configured_names: Vec<String> =
-                custom_models.iter().map(|m| m.name.clone()).collect();
             if self.dynamic_models == Some(false) {
-                return Ok(configured_names);
+                let mut models = Vec::with_capacity(custom_models.len());
+                for configured in custom_models {
+                    models.push(self.fetch_model_info(&configured.name).await?);
+                }
+                self.cache_model_info(&models);
+                return Ok(models);
             }
-            match self.fetch_models_from_api().await {
-                Ok(mut models) => {
-                    for configured_name in configured_names {
-                        if !models.iter().any(|model| model == &configured_name) {
-                            models.push(configured_name);
+        }
+
+        let models_path =
+            Self::map_base_path(&self.base_path, "models", OPEN_AI_DEFAULT_MODELS_PATH);
+        let paths = model_endpoint_paths(&self.api_client, &models_path);
+        match fetch_openai_compatible_model_info(&self.api_client, &paths).await {
+            Ok(discovered) => {
+                let mut models = discovered
+                    .into_iter()
+                    .map(|model| model.into_model_info(&self.metadata_provider))
+                    .collect::<Vec<_>>();
+                if let Some(custom_models) = &self.custom_models {
+                    for configured in custom_models {
+                        if let Some(discovered) = models
+                            .iter_mut()
+                            .find(|model| model.name == configured.name)
+                        {
+                            *discovered = discovered.clone().merge_overrides(configured);
+                        } else {
+                            models.push(self.fetch_model_info(&configured.name).await?);
                         }
                     }
-                    models.sort();
-                    models.dedup();
-                    Ok(models)
                 }
-                Err(e) if e.is_endpoint_not_found() => {
-                    tracing::debug!(
-                        "Models endpoint not implemented for provider '{}' ({}), using predefined list",
-                        self.name,
-                        e
-                    );
-                    Ok(configured_names)
-                }
-                Err(e) => Err(e),
+                models.sort_by(|left, right| left.name.cmp(&right.name));
+                self.cache_model_info(&models);
+                Ok(models)
             }
-        } else {
-            self.fetch_models_from_api().await
+            Err(error) if error.is_endpoint_not_found() => {
+                if let Some(custom_models) = &self.custom_models {
+                    let mut models = Vec::with_capacity(custom_models.len());
+                    for configured in custom_models {
+                        models.push(self.fetch_model_info(&configured.name).await?);
+                    }
+                    self.cache_model_info(&models);
+                    Ok(models)
+                } else {
+                    Err(error)
+                }
+            }
+            Err(error) => Err(error),
         }
+    }
+
+    async fn fetch_model_info(&self, model_name: &str) -> Result<ModelInfo, ProviderError> {
+        if let Some(info) = self.cached_model_info(model_name) {
+            return Ok(info);
+        }
+        if let Some(configured) = self
+            .custom_models
+            .as_ref()
+            .and_then(|models| models.iter().find(|model| model.name == model_name))
+        {
+            let info = model_info_for_provider_model(&self.metadata_provider, model_name);
+            let info = info.merge_overrides(configured);
+            self.cache_model_info(std::slice::from_ref(&info));
+            return Ok(info);
+        }
+        let info = model_info_for_provider_model(&self.metadata_provider, model_name);
+        self.cache_model_info(std::slice::from_ref(&info));
+        Ok(info)
     }
 
     async fn stream(
@@ -897,7 +966,9 @@ fn apply_declared_request_params(
     };
 
     for (key, value) in params {
-        if !is_reserved_request_param_key(key) {
+        if !crate::model::is_goose_internal_request_param(key)
+            && !is_reserved_request_param_key(key)
+        {
             object.insert(key.clone(), value.clone());
         }
     }
@@ -940,6 +1011,7 @@ pub fn from_declarative_config(
     let url = url::Url::parse(&normalized_base_url)
         .map_err(|e| anyhow::anyhow!("Invalid base URL '{}': {}", config.base_url, e))?;
 
+    let codex_compatible = is_codex_compatible_endpoint(&config.base_url);
     let host = url[..url::Position::BeforePath].to_string();
     let base_path = if let Some(ref explicit_path) = config.base_path {
         explicit_path.trim_start_matches('/').to_string()
@@ -984,6 +1056,17 @@ pub fn from_declarative_config(
         .name(config.name.clone())
         .custom_models(custom_models)
         .dynamic_models(config.dynamic_models)
+        .codex_compatible(codex_compatible)
+        .metadata_provider(
+            config
+                .catalog_provider_id
+                .as_deref()
+                .unwrap_or(if codex_compatible {
+                    "chatgpt_codex"
+                } else {
+                    "openai"
+                }),
+        )
         .skip_canonical_filtering(config.skip_canonical_filtering)
         .preserve_thinking_context(config.preserves_thinking))
 }
@@ -1043,7 +1126,10 @@ mod tests {
             dynamic_models: None,
             skip_canonical_filtering: false,
             preserve_thinking_context: false,
+            codex_compatible: false,
+            metadata_provider: name.to_string(),
             n_ctx_cache: Arc::new(Mutex::new(HashMap::new())),
+            model_info_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1406,6 +1492,127 @@ mod tests {
     }
 
     #[test]
+    fn codex_endpoint_detection_uses_exact_host() {
+        for url in [
+            "https://api.dahetao.org",
+            "api.dahetao.org/v1",
+            "https://API.DAHETAO.ORG/prefix/v1?test=1",
+        ] {
+            assert!(is_codex_compatible_endpoint(url));
+        }
+        for url in [
+            "https://api.openai.com",
+            "https://api.dahetao.org.example.com",
+            "https://example.com/api.dahetao.org",
+        ] {
+            assert!(!is_codex_compatible_endpoint(url));
+        }
+    }
+
+    #[test]
+    fn dahetao_preserves_custom_identity_and_url_path() {
+        for (url, expected_path) in [
+            ("https://api.dahetao.org", "v1/responses"),
+            ("https://api.dahetao.org/v1", "v1/responses"),
+            ("https://api.dahetao.org/prefix/v1", "prefix/v1/responses"),
+        ] {
+            let mut config = custom_config(url);
+            config.name = "custom_dahetao".to_string();
+            let provider =
+                from_declarative_config(config, None, crate::declarative::EnvKeyResolver)
+                    .unwrap()
+                    .build();
+            assert_eq!(provider.name, "custom_dahetao");
+            assert_eq!(provider.api_client.host(), "https://api.dahetao.org");
+            assert_eq!(provider.metadata_provider, "chatgpt_codex");
+            assert!(provider.should_use_responses_api_for_provider("gpt-6-astra"));
+            assert_eq!(
+                OpenAiProvider::map_base_path(
+                    &provider.base_path,
+                    "responses",
+                    OPEN_AI_DEFAULT_RESPONSES_PATH
+                ),
+                expected_path
+            );
+        }
+        let mut config = custom_config("https://api.dahetao.org");
+        config.base_path = Some("/custom/responses".to_string());
+        config.catalog_provider_id = Some("openai".to_string());
+        let provider = from_declarative_config(config, None, crate::declarative::EnvKeyResolver)
+            .unwrap()
+            .build();
+        assert_eq!(provider.base_path, "custom/responses");
+        assert_eq!(provider.metadata_provider, "openai");
+        assert!(provider.should_use_responses_api_for_provider("gpt-6-astra"));
+    }
+
+    #[tokio::test]
+    async fn dahetao_posts_responses_with_custom_auth_and_reasoning() {
+        use wiremock::matchers::{body_partial_json, header, method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        struct TestKeyResolver;
+        impl KeyResolver for TestKeyResolver {
+            type Error = std::convert::Infallible;
+            fn resolve_key(&self, key: &str) -> std::result::Result<String, Self::Error> {
+                assert_eq!(key, "TEST_DAHETAO_KEY");
+                Ok("test-key".to_string())
+            }
+        }
+
+        for streaming in [false, true] {
+            let server = MockServer::start().await;
+            let response = json!({
+                "id": "resp_1", "object": "response", "created_at": 0, "status": "completed",
+                "model": "gpt-6-astra", "output": [],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+            });
+            let template = if streaming {
+                let event = json!({"type": "response.completed", "sequence_number": 1, "response": response});
+                ResponseTemplate::new(200)
+                    .set_body_string(format!("data: {event}\n\ndata: [DONE]\n\n"))
+                    .append_header("content-type", "text/event-stream")
+            } else {
+                ResponseTemplate::new(200).set_body_json(response)
+            };
+            Mock::given(method("POST"))
+                .and(path("/prefix/v1/responses"))
+                .and(query_param("test", "1"))
+                .and(header("authorization", "Bearer test-key"))
+                .and(body_partial_json(json!({"model": "gpt-6-astra", "stream": streaming, "reasoning": {"effort": "xhigh"}})))
+                .respond_with(template).expect(1).mount(&server).await;
+
+            let mut config = custom_config("https://api.dahetao.org/prefix/v1?test=1");
+            config.api_key_env = "TEST_DAHETAO_KEY".to_string();
+            config.requires_auth = true;
+            config.supports_streaming = Some(streaming);
+            let target = url::Url::parse(&server.uri()).unwrap();
+            let provider = from_declarative_config(config, None, TestKeyResolver)
+                .unwrap()
+                .map_api_client(|client| {
+                    client.with_request_builder(Arc::new(move |builder| {
+                        let (client, request) = builder.build_split();
+                        let mut request = request?;
+                        assert_eq!(request.url().host_str(), Some("api.dahetao.org"));
+                        request.url_mut().set_scheme("http").unwrap();
+                        request.url_mut().set_host(target.host_str()).unwrap();
+                        request.url_mut().set_port(target.port()).unwrap();
+                        Ok(reqwest::RequestBuilder::from_parts(client, request))
+                    }))
+                })
+                .build();
+            let mut model = ModelConfig::new("gpt-6-astra")
+                .with_thinking_effort(ThinkingEffort::Max)
+                .with_merged_request_params(HashMap::from([(
+                    "thinking_efforts".to_string(),
+                    json!(["max", "high", "off"]),
+                )]));
+            model.reasoning = Some(true);
+            provider.complete(&model, "system", &[], &[]).await.unwrap();
+        }
+    }
+
+    #[test]
     fn from_custom_config_preserves_ipv6_authority() {
         let provider = from_declarative_config(
             custom_config("http://[::1]:1234/v1"),
@@ -1508,7 +1715,10 @@ mod tests {
             dynamic_models: Some(true),
             skip_canonical_filtering: false,
             preserve_thinking_context: false,
+            codex_compatible: false,
+            metadata_provider: "test-provider".to_string(),
             n_ctx_cache: Arc::new(Mutex::new(HashMap::new())),
+            model_info_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1837,6 +2047,40 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn discovered_model_metadata_is_used_and_static_context_overrides_it() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{
+                    "id": "gpt-4o",
+                    "context_length": 32_000,
+                    "reasoning": true
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProviderBuilder::new(
+            ApiClient::new_with_tls(server.uri(), AuthMethod::NoAuth, None).unwrap(),
+        )
+        .name("custom-openai")
+        .metadata_provider("openai")
+        .custom_models(Some(vec![
+            ModelInfo::new("gpt-4o").with_context_limit(64_000)
+        ]))
+        .dynamic_models(Some(true))
+        .build();
+
+        let models = provider.fetch_supported_model_info().await.unwrap();
+        assert_eq!(models[0].context_limit, Some(64_000));
+        assert!(models[0].reasoning);
+    }
+
     use crate::base::ThinkingPreservationFormat;
 
     fn cerebras_config() -> DeclarativeProviderConfig {
@@ -1907,6 +2151,8 @@ mod tests {
 
         let params = HashMap::from([
             ("reasoning_format".to_string(), json!("parsed")),
+            ("thinking_effort".to_string(), json!("high")),
+            ("thinking_efforts".to_string(), json!(["high", "low"])),
             ("model".to_string(), json!("hijacked")),
             ("stream".to_string(), json!(false)),
             ("stream_options".to_string(), json!(null)),
@@ -1920,5 +2166,7 @@ mod tests {
         assert_eq!(payload["stream"], json!(true));
         assert_eq!(payload["stream_options"], json!({"include_usage": true}));
         assert_eq!(payload["messages"].as_array().unwrap().len(), 1);
+        assert!(payload.get("thinking_effort").is_none());
+        assert!(payload.get("thinking_efforts").is_none());
     }
 }
