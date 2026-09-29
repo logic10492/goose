@@ -35,10 +35,11 @@ let cfg = {
       },
     ],
     // Usage descriptions for macOS TCC (Transparency, Consent, and Control)
-    NSMicrophoneUsageDescription:
-      'Goose needs access to your microphone for voice dictation.',
+    NSMicrophoneUsageDescription: 'Goose needs access to your microphone for voice dictation.',
     NSAppleEventsUsageDescription:
       'Goose needs access to send Apple Events to control other apps on your behalf.',
+    NSLocalNetworkUsageDescription:
+      'Goose needs access to your local network to connect to local AI services.',
   },
 };
 

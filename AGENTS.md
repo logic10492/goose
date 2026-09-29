@@ -122,3 +122,9 @@ ui/text/      # deprecated ACP TUI (see ui/text/README.md)
 - CLI: crates/goose-cli/src/main.rs
 - UI: ui/desktop/src/main.ts
 - Agent: crates/goose/src/agents/agent.rs
+
+## macOS Desktop Local Network Packaging
+
+- macOS local-network access needs both the `NSLocalNetworkUsageDescription` key in `ui/desktop/forge.config.ts` and the appropriate network entitlements in `ui/desktop/entitlements.plist`. The usage description triggers the Local Network privacy prompt; `com.apple.security.network.client` and `com.apple.security.network.server` are separate sandbox entitlements.
+- The Electron Forge signing configuration only injects `entitlements.plist` when `APPLE_TEAM_ID` is set. After building a macOS app, verify `Contents/Info.plist` and the signed entitlements with `plutil` and `codesign -d --entitlements :-`.
+- Never overwrite a running `.app` or executable in place. Quit the existing app and backend first, then remove or atomically rename the old bundle before installing the rebuilt bundle; otherwise macOS may terminate the process with `Code Signature Invalid`.
