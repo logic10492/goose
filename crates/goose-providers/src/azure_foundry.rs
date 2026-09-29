@@ -11,6 +11,7 @@ use crate::api_client::{ApiClient, AuthMethod, RequestBuilderDecorator, TlsConfi
 use crate::base::{
     ConfigKey, MessageStream, ModelInfo, Provider, ProviderDescriptor, ProviderMetadata,
 };
+use crate::canonical::Modality;
 use crate::conversation::message::Message;
 use crate::errors::ProviderError;
 use crate::formats::openai::{extract_reasoning_effort, is_openai_responses_model};
@@ -414,9 +415,13 @@ fn model_info_for_deployment(deployment_name: &str, model_name: &str) -> ModelIn
         currency: None,
         supports_cache_control: None,
         reasoning: canonical
+            .as_ref()
             .and_then(|model| model.reasoning)
             .unwrap_or_else(|| ModelConfig::new(model_name).is_reasoning_model()),
         thinking_preservation_format: None,
+        supports_vision: canonical
+            .as_ref()
+            .map(|model| model.modalities.input.contains(&Modality::Image)),
         request_params: None,
     }
 }

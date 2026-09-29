@@ -12,7 +12,8 @@
       "input_token_cost": null,
       "output_token_cost": null,
       "currency": null,
-      "supports_cache_control": null
+      "supports_cache_control": null,
+      "supports_vision": true
     },
     {
       "name": "deepseek-v4-pro",

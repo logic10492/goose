@@ -276,6 +276,7 @@ pub fn update_custom_provider(params: UpdateCustomProviderParams) -> Result<()> 
                         .thinking_preservation_format
                         .or(existing.thinking_preservation_format);
                     model.request_params = model.request_params.or(existing.request_params.clone());
+                    model.supports_vision = model.supports_vision.or(existing.supports_vision);
                 }
                 model
             })
@@ -572,6 +573,7 @@ mod tests {
                 supports_cache_control: None,
                 reasoning: false,
                 thinking_preservation_format: None,
+                supports_vision: None,
                 request_params: None,
             }],
             headers: None,
