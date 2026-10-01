@@ -34,6 +34,7 @@ pub fn is_goose_internal_request_param(key: &str) -> bool {
             | "emit_clear_thinking"
             | "preserve_thinking_context"
             | "preserve_unsigned_thinking"
+            | "api_type"
     )
 }
 
@@ -379,6 +380,12 @@ mod tests {
                 .get("queue_threshold"),
             Some(&"500".to_string())
         );
+    }
+
+    #[test]
+    fn api_type_is_goose_internal_request_param() {
+        assert!(is_goose_internal_request_param("api_type"));
+        assert!(!is_goose_internal_request_param("temperature"));
     }
 
     mod thinking_effort_tests {

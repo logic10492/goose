@@ -101,6 +101,24 @@ const DEFAULT_TIMEOUT_SECONDS: u64 = 600;
 
 type OpenAiBaseUrlParts = (String, Vec<(String, String)>, bool);
 
+/// Per-model request surface override declared via `request_params.api_type`.
+/// Gateways with a unified base URL can expose models that only work on one
+/// of the two OpenAI request surfaces, so an explicit declaration wins over
+/// host/model-name based routing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApiType {
+    Responses,
+    ChatCompletions,
+}
+
+fn parse_api_type(value: Option<&str>) -> Option<ApiType> {
+    match value {
+        Some("responses") => Some(ApiType::Responses),
+        Some("chat_completions") => Some(ApiType::ChatCompletions),
+        _ => None,
+    }
+}
+
 /// Ensure a base URL has an explicit scheme.
 ///
 /// Users frequently enter hosts like `localhost:1234` without a scheme. The
@@ -586,7 +604,12 @@ impl OpenAiProvider {
         payload
     }
 
-    fn should_use_responses_api_for_provider(&self, model_name: &str) -> bool {
+    fn should_use_responses_api_for_provider(&self, model_config: &ModelConfig) -> bool {
+        match self.api_type_override(model_config) {
+            Some(ApiType::Responses) => return true,
+            Some(ApiType::ChatCompletions) => return false,
+            None => {}
+        }
         if self.codex_compatible {
             return true;
         }
@@ -594,7 +617,21 @@ impl OpenAiProvider {
             return false;
         }
 
-        Self::should_use_responses_api(model_name, &self.base_path)
+        Self::should_use_responses_api(&model_config.model_name, &self.base_path)
+    }
+
+    fn api_type_override(&self, model_config: &ModelConfig) -> Option<ApiType> {
+        model_config
+            .request_params
+            .as_ref()
+            .and_then(|params| params.get("api_type"))
+            .and_then(|value| parse_api_type(value.as_str()))
+            .or_else(|| {
+                self.declared_model(&model_config.model_name)
+                    .and_then(|model| model.request_params.as_ref())
+                    .and_then(|params| params.get("api_type"))
+                    .and_then(|value| parse_api_type(value.as_str()))
+            })
     }
 
     fn map_base_path(base_path: &str, target: &str, fallback: &str) -> String {
@@ -871,7 +908,7 @@ impl Provider for OpenAiProvider {
         messages: &[Message],
         tools: &[Tool],
     ) -> Result<MessageStream, ProviderError> {
-        if self.should_use_responses_api_for_provider(&model_config.model_name) {
+        if self.should_use_responses_api_for_provider(model_config) {
             let (wire_model, _) =
                 crate::formats::openai::extract_reasoning_effort(&model_config.model_name);
             self.stream_for_model(
@@ -991,6 +1028,23 @@ pub fn from_declarative_config(
              at least one entry in `models` is required.",
             config.name
         ));
+    }
+
+    for model in &config.models {
+        if let Some(api_type) = model
+            .request_params
+            .as_ref()
+            .and_then(|params| params.get("api_type"))
+        {
+            if parse_api_type(api_type.as_str()).is_none() {
+                anyhow::bail!(
+                    "Model '{}' declares invalid api_type '{}'. \
+                    Supported values are: responses, chat_completions",
+                    model.name,
+                    api_type
+                );
+            }
+        }
     }
 
     let api_key = if config.api_key_env.is_empty() {
@@ -1336,8 +1390,8 @@ mod tests {
     fn nearai_uses_chat_completions_for_openai_reasoning_models() {
         let provider = make_provider("nearai");
 
-        assert!(!provider.should_use_responses_api_for_provider("openai/gpt-5"));
-        assert!(!provider.should_use_responses_api_for_provider("openai/o3"));
+        assert!(!provider.should_use_responses_api_for_provider(&ModelConfig::new("openai/gpt-5")));
+        assert!(!provider.should_use_responses_api_for_provider(&ModelConfig::new("openai/o3")));
     }
 
     #[test]
@@ -1525,7 +1579,9 @@ mod tests {
             assert_eq!(provider.name, "custom_dahetao");
             assert_eq!(provider.api_client.host(), "https://api.dahetao.org");
             assert_eq!(provider.metadata_provider, "chatgpt_codex");
-            assert!(provider.should_use_responses_api_for_provider("gpt-6-astra"));
+            assert!(
+                provider.should_use_responses_api_for_provider(&ModelConfig::new("gpt-6-astra"))
+            );
             assert_eq!(
                 OpenAiProvider::map_base_path(
                     &provider.base_path,
@@ -1543,7 +1599,156 @@ mod tests {
             .build();
         assert_eq!(provider.base_path, "custom/responses");
         assert_eq!(provider.metadata_provider, "openai");
-        assert!(provider.should_use_responses_api_for_provider("gpt-6-astra"));
+        assert!(provider.should_use_responses_api_for_provider(&ModelConfig::new("gpt-6-astra")));
+    }
+
+    #[test]
+    fn api_type_override_routes_model_across_request_surfaces() {
+        fn model_with_api_type(name: &str, api_type: Option<&str>) -> ModelConfig {
+            let mut model = ModelConfig::new(name);
+            if let Some(api_type) = api_type {
+                model = model.with_merged_request_params(HashMap::from([(
+                    "api_type".to_string(),
+                    json!(api_type),
+                )]));
+            }
+            model
+        }
+
+        let mut config = custom_config("https://api.dahetao.org");
+        config.name = "custom_dahetao".to_string();
+        let provider = from_declarative_config(config, None, crate::declarative::EnvKeyResolver)
+            .unwrap()
+            .build();
+
+        assert!(
+            !provider.should_use_responses_api_for_provider(&model_with_api_type(
+                "glm-5.3",
+                Some("chat_completions")
+            ))
+        );
+        assert!(
+            provider.should_use_responses_api_for_provider(&model_with_api_type(
+                "gpt-5.6-sol",
+                Some("responses")
+            ))
+        );
+        assert!(provider
+            .should_use_responses_api_for_provider(&model_with_api_type("gpt-5.6-sol", None)));
+        assert!(provider
+            .should_use_responses_api_for_provider(&model_with_api_type("glm-5.3", Some("bogus"))));
+
+        let provider = make_provider_with_custom_models(
+            "http://localhost",
+            "v1/chat/completions",
+            vec!["test-model".to_string()],
+        );
+        assert!(!provider
+            .should_use_responses_api_for_provider(&model_with_api_type("test-model", None)));
+        assert!(
+            provider.should_use_responses_api_for_provider(&model_with_api_type(
+                "test-model",
+                Some("responses")
+            ))
+        );
+    }
+
+    #[test]
+    fn api_type_override_falls_back_to_declared_model() {
+        let mut config = custom_config("https://api.dahetao.org");
+        config.name = "custom_dahetao".to_string();
+        config.models = vec![{
+            let mut model = crate::base::ModelInfo::new("deepseek-v4-pro");
+            model.request_params = Some(HashMap::from([(
+                "api_type".to_string(),
+                json!("chat_completions"),
+            )]));
+            model
+        }];
+        let provider = from_declarative_config(config, None, crate::declarative::EnvKeyResolver)
+            .unwrap()
+            .build();
+
+        assert!(
+            !provider.should_use_responses_api_for_provider(&ModelConfig::new("deepseek-v4-pro"))
+        );
+    }
+
+    #[test]
+    fn from_custom_config_rejects_invalid_api_type() {
+        let mut config = custom_config("https://api.dahetao.org");
+        config.models = vec![{
+            let mut model = crate::base::ModelInfo::new("glm-5.3");
+            model.request_params = Some(HashMap::from([("api_type".to_string(), json!("chat"))]));
+            model
+        }];
+
+        let err = match from_declarative_config(config, None, crate::declarative::EnvKeyResolver) {
+            Ok(_) => panic!("invalid api_type should be rejected at construction"),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+        assert!(message.contains("glm-5.3"), "got: {message}");
+        assert!(message.contains("chat"), "got: {message}");
+        assert!(
+            message.contains("responses, chat_completions"),
+            "got: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dahetao_api_type_override_posts_chat_completions() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_partial_json(
+                json!({"model": "glm-5.3", "messages": []}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "hello"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut config = custom_config("https://api.dahetao.org");
+        config.models = vec![{
+            let mut model = crate::base::ModelInfo::new("glm-5.3");
+            model.request_params = Some(HashMap::from([(
+                "api_type".to_string(),
+                json!("chat_completions"),
+            )]));
+            model
+        }];
+        config.supports_streaming = Some(false);
+        let target = url::Url::parse(&server.uri()).unwrap();
+        let provider = from_declarative_config(config, None, crate::declarative::EnvKeyResolver)
+            .unwrap()
+            .map_api_client(|client| {
+                client.with_request_builder(Arc::new(move |builder| {
+                    let (client, request) = builder.build_split();
+                    let mut request = request?;
+                    assert_eq!(request.url().host_str(), Some("api.dahetao.org"));
+                    request.url_mut().set_scheme("http").unwrap();
+                    request.url_mut().set_host(target.host_str()).unwrap();
+                    request.url_mut().set_port(target.port()).unwrap();
+                    Ok(reqwest::RequestBuilder::from_parts(client, request))
+                }))
+            })
+            .build();
+
+        provider
+            .complete(&ModelConfig::new("glm-5.3"), "", &[], &[])
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
