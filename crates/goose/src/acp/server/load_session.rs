@@ -350,6 +350,7 @@ impl GooseAcpAgent {
             &self.provider_inventory,
             &session,
             &agent_thinking_effort_support(&agent).await,
+            self.flatten_models,
         )
         .await?;
 

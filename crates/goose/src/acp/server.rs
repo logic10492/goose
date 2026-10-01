@@ -2,10 +2,10 @@ use crate::acp::custom_notifications::*;
 use crate::acp::custom_requests::*;
 use crate::acp::fs::AcpTools;
 pub(super) use crate::acp::response_builder::{
-    agent_thinking_effort_support, build_config_options, build_mode_state, build_model_state,
-    build_provider_options, build_session_info, build_session_setup_config,
+    agent_thinking_effort_support, build_config_options, build_flat_model_state, build_mode_state,
+    build_model_state, build_provider_options, build_session_info, build_session_setup_config,
     send_session_setup_notifications, session_meta, session_provider_selection,
-    session_response_meta, should_refresh_inventory_for_session_init,
+    session_response_meta, should_refresh_inventory_for_session_init, split_flat_model_id,
 };
 use crate::acp::tool_call_notifier::ToolCallNotifier;
 use crate::acp::{PermissionDecision, ACP_CURRENT_MODEL};
@@ -320,6 +320,7 @@ pub struct GooseAcpAgentOptions {
     pub config_dir: std::path::PathBuf,
     pub disable_session_naming: bool,
     pub goose_platform: GoosePlatform,
+    pub flatten_models: bool,
     pub additional_source_roots: Vec<SourceRoot>,
     pub scheduler: Option<Arc<dyn SchedulerTrait>>,
     /// When set, new sessions use this host-controlled working directory instead
@@ -353,6 +354,7 @@ pub struct GooseAcpAgent {
     session_manager: Arc<SessionManager>,
     permission_manager: Arc<PermissionManager>,
     disable_session_naming: bool,
+    flatten_models: bool,
     provider_inventory: ProviderInventoryService,
     additional_source_roots: Vec<SourceRoot>,
     session_cwd: Option<PathBuf>,
@@ -974,6 +976,7 @@ impl GooseAcpAgent {
             session_manager,
             permission_manager,
             disable_session_naming: options.disable_session_naming,
+            flatten_models: options.flatten_models,
             provider_inventory,
             additional_source_roots: options.additional_source_roots,
             session_cwd: options.session_cwd,
@@ -2373,6 +2376,24 @@ impl GooseAcpAgent {
             .await
             .internal_err_ctx("Failed to get provider")?;
         let provider_name = current_provider.get_name().to_string();
+        let provider_ids: Vec<String> = if self.flatten_models {
+            crate::providers::providers()
+                .await
+                .into_iter()
+                .map(|(metadata, _)| metadata.name)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let model_id = match split_flat_model_id(model_id, &provider_ids) {
+            Some((provider, model)) if provider != provider_name.as_str() => {
+                return self
+                    .update_provider(session_id, provider, Some(model), None, None)
+                    .await;
+            }
+            Some((_, model)) => model,
+            None => model_id,
+        };
         let current_model_config = agent
             .model_config_for_session(session_id)
             .await
@@ -2426,7 +2447,16 @@ impl GooseAcpAgent {
             return Err(agent_client_protocol::Error::internal_error()
                 .data(format!("Unknown provider inventory: {}", provider_name)));
         };
-        let model_state = build_model_state(current_model.as_str(), &inventory);
+        let model_state = if self.flatten_models {
+            build_flat_model_state(
+                &provider_name,
+                current_model.as_str(),
+                &self.provider_inventory,
+            )
+            .await
+        } else {
+            build_model_state(current_model.as_str(), &inventory)
+        };
         let mode_state = build_mode_state(goose_mode)?;
         let provider_options = build_provider_options(Some(&provider_name)).await;
         let config_options = build_config_options(
@@ -2646,7 +2676,11 @@ impl agent_client_protocol::ConnectTo<Client> for GooseAgentConnection {
     }
 }
 
-pub async fn run(builtins: Vec<String>, enable_scheduler: bool) -> Result<()> {
+pub async fn run(
+    builtins: Vec<String>,
+    enable_scheduler: bool,
+    flatten_models: bool,
+) -> Result<()> {
     info!("listening on stdio");
 
     let outgoing = tokio::io::stdout().compat_write();
@@ -2661,6 +2695,7 @@ pub async fn run(builtins: Vec<String>, enable_scheduler: bool) -> Result<()> {
             additional_source_roots: Vec::new(),
             session_cwd: None,
             enable_scheduler,
+            flatten_models,
         },
     );
     let agent = server.create_agent().await?;
@@ -3536,6 +3571,7 @@ print(\"hello, world\")
                 config_dir: root.path().to_path_buf(),
                 disable_session_naming: true,
                 goose_platform: GoosePlatform::GooseCli,
+                flatten_models: false,
                 additional_source_roots: Vec::new(),
                 scheduler: None,
                 session_cwd: None,

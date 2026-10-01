@@ -374,6 +374,7 @@ mod tests {
             data_dir: root.path().join("data"),
             config_dir: root.path().join("config"),
             goose_platform: GoosePlatform::GooseCli,
+            flatten_models: false,
             additional_source_roots: Vec::new(),
             session_cwd: None,
             enable_scheduler: false,

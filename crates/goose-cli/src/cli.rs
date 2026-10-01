@@ -57,6 +57,19 @@ enum ServePlatform {
     Desktop,
 }
 
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum AcpPlatform {
+    #[default]
+    Cli,
+    Shellular,
+}
+
+impl AcpPlatform {
+    fn flatten_models(self) -> bool {
+        matches!(self, AcpPlatform::Shellular)
+    }
+}
+
 impl From<ServePlatform> for GoosePlatform {
     fn from(platform: ServePlatform) -> Self {
         match platform {
@@ -840,6 +853,9 @@ enum Command {
 
         #[arg(long, help = "Enable scheduled recipe execution")]
         enable_scheduler: bool,
+
+        #[arg(long, value_enum, default_value_t = AcpPlatform::Cli)]
+        platform: AcpPlatform,
     },
 
     /// Share or connect to agents peer-to-peer over iroh
@@ -1793,6 +1809,7 @@ async fn handle_serve_command(args: ServeCommandArgs) -> Result<()> {
         data_dir: Paths::data_dir(),
         config_dir: Paths::config_dir(),
         goose_platform: platform.into(),
+        flatten_models: false,
         additional_source_roots,
         session_cwd: None,
         enable_scheduler,
@@ -2808,7 +2825,8 @@ pub async fn cli() -> anyhow::Result<()> {
         Some(Command::Acp {
             builtins,
             enable_scheduler,
-        }) => goose::acp::server::run(builtins, enable_scheduler).await,
+            platform,
+        }) => goose::acp::server::run(builtins, enable_scheduler, platform.flatten_models()).await,
         #[cfg(feature = "roaming")]
         Some(Command::Roam { command }) => handle_roam_command(command).await,
         Some(Command::Serve {
@@ -2963,6 +2981,27 @@ pub async fn cli() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn acp_platform_defaults_to_cli() {
+        let cli = Cli::try_parse_from(["goose", "acp"]).expect("parse failed");
+
+        match cli.command {
+            Some(Command::Acp { platform, .. }) => assert_eq!(platform, AcpPlatform::Cli),
+            _ => panic!("expected acp command"),
+        }
+    }
+
+    #[test]
+    fn acp_platform_accepts_shellular() {
+        let cli =
+            Cli::try_parse_from(["goose", "acp", "--platform", "shellular"]).expect("parse failed");
+
+        match cli.command {
+            Some(Command::Acp { platform, .. }) => assert!(platform.flatten_models()),
+            _ => panic!("expected acp command"),
+        }
+    }
 
     #[test]
     fn completion_command_accepts_nushell_alias() {

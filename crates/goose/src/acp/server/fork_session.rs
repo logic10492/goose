@@ -68,9 +68,13 @@ impl GooseAcpAgent {
             meta.insert("extensionResults".to_string(), v);
         }
 
-        let (mode_state, config_options) =
-            build_session_setup_config(&self.provider_inventory, &goose_session, &effort_support)
-                .await?;
+        let (mode_state, config_options) = build_session_setup_config(
+            &self.provider_inventory,
+            &goose_session,
+            &effort_support,
+            self.flatten_models,
+        )
+        .await?;
 
         let mut response = ForkSessionResponse::new(acp_session_id.clone())
             .modes(mode_state)

@@ -701,6 +701,7 @@ async fn handle_share(
         data_dir: Paths::data_dir(),
         config_dir: Paths::config_dir(),
         goose_platform: GoosePlatform::GooseCli,
+        flatten_models: false,
         additional_source_roots: Vec::new(),
         session_cwd: Some(session_cwd.clone()),
         enable_scheduler: false,

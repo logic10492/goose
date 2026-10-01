@@ -158,6 +158,59 @@ pub(super) fn build_model_state(
     }
 }
 
+/// Split a `provider/model` id when it starts with a known provider id.
+/// The longest matching provider wins, so model ids may themselves contain `/`.
+pub(super) fn split_flat_model_id<'a>(
+    model_id: &'a str,
+    provider_ids: &'a [String],
+) -> Option<(&'a str, &'a str)> {
+    provider_ids
+        .iter()
+        .filter_map(|provider_id| {
+            let model = model_id
+                .strip_prefix(provider_id.as_str())?
+                .strip_prefix('/')?;
+            (!model.is_empty()).then_some((provider_id.as_str(), model))
+        })
+        .max_by_key(|(provider_id, _)| provider_id.len())
+}
+
+/// Model options across every configured provider, encoded as `provider/model`.
+pub(super) async fn build_flat_model_state(
+    current_provider: &str,
+    current_model: &str,
+    provider_inventory: &ProviderInventoryService,
+) -> ModelSelection {
+    let provider_ids: Vec<String> = crate::providers::providers()
+        .await
+        .into_iter()
+        .map(|(metadata, _)| metadata.name)
+        .collect();
+    let current_id = format!("{current_provider}/{current_model}");
+    let mut seen = std::collections::HashSet::from([current_id.clone()]);
+    let mut available_models = vec![ModelOption {
+        id: current_id.clone(),
+        name: current_id.clone(),
+    }];
+    if let Ok(entries) = provider_inventory.entries(&provider_ids).await {
+        for entry in entries.into_iter().filter(|entry| entry.configured) {
+            for model in entry.models {
+                let id = format!("{}/{}", entry.provider_id, model.id);
+                if seen.insert(id.clone()) {
+                    available_models.push(ModelOption {
+                        id,
+                        name: format!("{} · {}", entry.provider_name, model.name),
+                    });
+                }
+            }
+        }
+    }
+    ModelSelection {
+        current_model_id: current_id,
+        available_models,
+    }
+}
+
 struct ProviderOptionEntry {
     id: String,
     label: String,
@@ -246,6 +299,7 @@ pub(super) async fn build_session_setup_config(
     provider_inventory: &ProviderInventoryService,
     session: &Session,
     effort_support: &ThinkingEffortSupport,
+    flatten_models: bool,
 ) -> Result<(SessionModeState, Option<Vec<SessionConfigOption>>), agent_client_protocol::Error> {
     let mode_state = build_mode_state(session.goose_mode)?;
 
@@ -261,7 +315,16 @@ pub(super) async fn build_session_setup_config(
     else {
         return Ok((mode_state, None));
     };
-    let model_state = build_model_state(model_config.model_name.as_str(), &inventory);
+    let model_state = if flatten_models {
+        build_flat_model_state(
+            provider_name,
+            model_config.model_name.as_str(),
+            provider_inventory,
+        )
+        .await
+    } else {
+        build_model_state(model_config.model_name.as_str(), &inventory)
+    };
     let provider_selection = session_provider_selection(session);
     let provider_options = build_provider_options(Some(provider_name)).await;
     let config_options = build_config_options(
@@ -960,5 +1023,35 @@ mod tests {
 
         assert_eq!(current, "off");
         assert_eq!(values, vec![SessionConfigSelectOption::new("off", "off")]);
+    }
+}
+
+#[cfg(test)]
+mod flatten_model_tests {
+    use super::split_flat_model_id;
+
+    #[test]
+    fn split_flat_model_id_matches_provider_prefix() {
+        let providers = vec!["deepseek".to_string(), "dahetao".to_string()];
+        assert_eq!(
+            split_flat_model_id("dahetao/deepseek-v4.1-flash", &providers),
+            Some(("dahetao", "deepseek-v4.1-flash"))
+        );
+    }
+
+    #[test]
+    fn split_flat_model_id_keeps_slashes_in_model_ids() {
+        let providers = vec!["openrouter".to_string(), "anthropic".to_string()];
+        assert_eq!(
+            split_flat_model_id("openrouter/anthropic/claude-sonnet", &providers),
+            Some(("openrouter", "anthropic/claude-sonnet"))
+        );
+    }
+
+    #[test]
+    fn split_flat_model_id_ignores_unknown_prefixes() {
+        let providers = vec!["deepseek".to_string()];
+        assert_eq!(split_flat_model_id("deepseek-v4.1-flash", &providers), None);
+        assert_eq!(split_flat_model_id("other/model", &providers), None);
     }
 }

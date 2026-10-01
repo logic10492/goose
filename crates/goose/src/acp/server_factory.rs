@@ -15,6 +15,7 @@ pub struct AcpServerFactoryConfig {
     pub data_dir: std::path::PathBuf,
     pub config_dir: std::path::PathBuf,
     pub goose_platform: GoosePlatform,
+    pub flatten_models: bool,
     pub additional_source_roots: Vec<SourceRoot>,
     /// When set, new sessions use this host-controlled working directory
     /// instead of the `cwd` the connecting client sends. Used by roaming, where
@@ -120,6 +121,7 @@ impl AcpServer {
             config_dir: self.config.config_dir.clone(),
             disable_session_naming,
             goose_platform: self.config.goose_platform.clone(),
+            flatten_models: self.config.flatten_models,
             additional_source_roots: self.config.additional_source_roots.clone(),
             session_cwd,
             scheduler,
@@ -142,6 +144,7 @@ mod tests {
             config_dir: data_dir.clone(),
             data_dir,
             goose_platform: GoosePlatform::GooseCli,
+            flatten_models: false,
             additional_source_roots: Vec::new(),
             session_cwd: None,
             enable_scheduler,
